@@ -1,6 +1,5 @@
 /target
-# 插件 dll 由 build.cmd 从 target 复制过来，属于构建产物
-/plugin/*.dll
+# 插件 dll 随仓库分发（宿主以文件是否存在判断装没装），*.incoming 只是导入时的中转文件
 /plugin/*.incoming
 /tools/*
 # 发布/更新相关脚本要入库（其余 tools 下内容如 mingw64 工具链仍忽略）
