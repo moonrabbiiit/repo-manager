@@ -57,13 +57,25 @@ rem ---- Windows cannot replace a running exe: warn before the link step ----
 tasklist /nh /fi "imagename eq repo-manager.exe" 2>nul | find /i "repo-manager.exe" >nul
 if not errorlevel 1 echo [!] repo-manager.exe is still running - close it, or the link step cannot replace the exe.
 
-cargo build --release
+rem ---- 主程序 + 插件一起构建（插件是 workspace 里的 cdylib）----
+cargo build --release --workspace
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :fail
+rem ---- 插件 dll 统一放仓库根的 plugin\\（不再埋进 target 里）----
+if not exist "%~dp0plugin" mkdir "%~dp0plugin"
+copy /y "%~dp0target\release\merge_plugin.dll" "%~dp0plugin\merge-plugin.dll" >nul
+if errorlevel 1 goto :fail
+copy /y "%~dp0target\release\ai_log_plugin.dll" "%~dp0plugin\ai-log-plugin.dll" >nul
+if errorlevel 1 goto :fail
+rem 老位置留着会盖住新目录（宿主优先认 exe 隔壁），清掉免得跑到旧 dll
+if exist "%~dp0target\release\plugins" rmdir /s /q "%~dp0target\release\plugins"
 echo.
 echo [OK] target\release\repo-manager.exe
+echo [OK] plugin\merge-plugin.dll
+echo [OK] plugin\ai-log-plugin.dll
 if defined SHOWVER echo      embedded version: V%SHOWVER%
 dir target\release\repo-manager.exe
+dir plugin\*.dll
 echo.
 pause
 exit /b 0

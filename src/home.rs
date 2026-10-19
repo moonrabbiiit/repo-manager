@@ -94,7 +94,7 @@ const MARK_H: f32 = 20.0;
 /// 计数胶囊的配色：(底色, 文字色)。
 /// 有待办时按语义色出一枚淡底深字胶囊——浅色主题走设计稿的粉彩底、压暗的字；
 /// 深色主题用半透明色底，字直接用原色。没待办就是一枚不抢眼的中性灰。
-fn pill_colors(ui: &Ui, hue: Color32, active: bool) -> (Color32, Color32) {
+pub(crate) fn pill_colors(ui: &Ui, hue: Color32, active: bool) -> (Color32, Color32) {
     if active {
         if ui.visuals().dark_mode {
             (tint(hue, 44), hue)
@@ -627,13 +627,15 @@ impl RepoApp {
             }
         }
         ui.separator();
-        // 两套规则装在同一个窗口里：上面那格是差异比对的名称筛选（只管「本地差异」那个数），
-        // 下面那格决定哪些改动不进提交清单。窗口是独立浮层，不受菜单点哪儿都收起的限制
+        // 四套规则装在同一扇窗的两页标签里：第一页是差异比对的名称筛选（只管「本地差异」那个数）
+        // 与屏蔽可提交项（决定哪些改动不进提交清单），第二页划定双向合并涉及哪些文件。
+        // 窗口是独立浮层，不受菜单点哪儿都收起的限制
         if ui
             .button("差异过滤与提交屏蔽")
             .on_hover_text(
-                "本目录的两套规则一起写，一行一条、存配置长期生效：差异比对的名称筛选（只管\
-                 「本地差异」那个数）、以及屏蔽可提交项（命中的不进提交清单，提交页上也看不到）",
+                "本目录的四套规则在此一并编辑，分作两页、均一行一条、保存于配置中长期生效：第一页是\
+                 差异比对的名称筛选（仅影响「本地差异」计数）与屏蔽可提交项（命中的条目不进入提交\
+                 清单，提交页中亦不显示）；第二页划定双向合并涉及哪些文件",
             )
             .clicked()
         {
@@ -678,6 +680,31 @@ impl RepoApp {
             {
                 self.open_resolve(index);
                 ui.close();
+            }
+            // 双向合并是可安装插件：没装就不在「更多」里露头
+            if self.plugin_installed(crate::plugins::PluginId::Merge) {
+                // 两侧一致时也允许预览，以建立后续修改与删除判定所需的同步状态。
+                let bound = !self.cfg.dirs[index].bc_target.trim().is_empty();
+                let clear = view.blocked.is_empty();
+                let writing = self.pool.is_writing(index);
+                let tip = match (bound, clear, writing) {
+                    (false, ..) => "先在「更多 → 绑定对比对象」里指定本地开发侧的目录".to_owned(),
+                    (true, false, _) => "该目录有未处理的条目，先在「解决冲突」里收干净再合并".to_owned(),
+                    (true, true, true) => "该目录还有写操作在跑，等这一趟结束再合并".to_owned(),
+                    (true, true, false) =>
+                        "核对两侧文件并预览合并；已一致的文件会记住同步状态，供下次判断修改和删除".to_owned(),
+                };
+                if ui
+                    .add_enabled(
+                        bound && clear && !writing,
+                        egui::Button::new(RichText::new("双向合并（预览）").strong()),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    self.open_merge(index);
+                    ui.close();
+                }
             }
         });
         if ui.button("▲ 上移").clicked() {
@@ -2588,6 +2615,129 @@ mod tests {
         let rules = stage.app.commit_rules.as_ref().expect("点规则入口要打开窗口");
         assert_eq!(rules.dir, 1, "开的是这一行的规则");
         assert_eq!(rules.filter_buf, "-*.iml\n-bin\\", "分号串要拆成一行一条");
+    }
+
+    /// 「更多 → 双向合并（预览）」的启用条件：绑了本地开发侧、比出过差异、工作副本没有
+    /// 待人工处理的条目、这一行没有写操作在跑，四样齐了才点得动；Git 目录里这条压根不画。
+    /// 验法是点下去看窗口开没开——置灰的那几下点了不该拿错的现状算清单
+    #[test]
+    fn merge_entry_only_opens_when_the_directory_is_ready() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_merge_entry_test"),
+        );
+        fn summary(n: usize) -> crate::localdiff::Summary {
+            crate::localdiff::Summary {
+                differing: n,
+                ..Default::default()
+            }
+        }
+        fn conflict() -> crate::svn::StatusEntry {
+            crate::svn::StatusEntry {
+                path: "Build".to_owned(),
+                name: "Build".to_owned(),
+                item: crate::svn::Item::Conflict,
+                props: String::new(),
+                checked: false,
+            }
+        }
+        /// 详细模式第一行的「更多」点开，返回那一帧的菜单
+        fn open_menu(stage: &mut Stage) -> Vec<(String, egui::Rect)> {
+            let texts = stage.step(None);
+            let more = texts
+                .iter()
+                .filter(|(text, _)| text == "更多")
+                .next()
+                .map(|(_, rect)| *rect)
+                .expect("第一行目录应有「更多」");
+            stage.step(Some(more.center()));
+            stage.step(None)
+        }
+        /// 菜单里那条双向合并：点一下，返回窗口开没开
+        fn click_merge(stage: &mut Stage, texts: &[(String, egui::Rect)]) -> bool {
+            let item = Stage::rect_of(texts, "双向合并（预览）")
+                .expect("置灰也要把这条画出来，让「为什么点不动」看得见");
+            stage.step(Some(item.center()));
+            stage.app.merge.is_some()
+        }
+        fn unbound(app: &mut RepoApp) {
+            app.dirs[0].local_diff = Some(summary(3));
+        }
+        fn no_diff(app: &mut RepoApp) {
+            app.cfg.dirs[0].bc_target = r"D:\dev\hrp".to_owned();
+            app.dirs[0].local_diff = Some(summary(0));
+        }
+        fn blocked(app: &mut RepoApp) {
+            app.cfg.dirs[0].bc_target = r"D:\dev\hrp".to_owned();
+            app.dirs[0].local_diff = Some(summary(3));
+            app.dirs[0].blocked.push(conflict());
+        }
+        fn writing(app: &mut RepoApp) {
+            app.cfg.dirs[0].bc_target = r"D:\dev\hrp".to_owned();
+            app.dirs[0].local_diff = Some(summary(3));
+            app.pool.spawn(Kind::ApplyMerge, 0, "正在写入 …".to_owned(), |_| {
+                Data::Run {
+                    dir: 0,
+                    ok: true,
+                    message: String::new(),
+                    reload: false,
+                }
+            });
+        }
+
+        // 条件齐了点开就开窗，并且开的是这一行。
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs[0].bc_target = r"D:\dev\hrp".to_owned();
+        stage.app.dirs[0].local_diff = Some(summary(3));
+        let texts = open_menu(&mut stage);
+        let item = Stage::rect_of(&texts, "双向合并（预览）").unwrap_or_else(|| {
+            panic!(
+                "SVN 目录的「更多」里应有双向合并入口，实际：{:?}",
+                texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            )
+        });
+        stage.step(Some(item.center()));
+        assert_eq!(
+            stage.app.merge.as_ref().map(|preview| preview.dir),
+            Some(0),
+            "条件齐了点开要开这一行的窗口"
+        );
+
+        let mut stage = Stage::new(false);
+        no_diff(&mut stage.app);
+        let texts = open_menu(&mut stage);
+        assert!(click_merge(&mut stage, &texts), "两侧一致时也应能预览并建立同步状态");
+
+        // 逐条拆掉一个条件：这条还画着，但点下去开不了窗
+        for (name, setup) in [
+            ("未绑定本地端", unbound as fn(&mut RepoApp)),
+            ("有未处理条目", blocked as fn(&mut RepoApp)),
+            ("有写操作在跑", writing as fn(&mut RepoApp)),
+        ] {
+            let mut stage = Stage::new(false);
+            setup(&mut stage.app);
+            let texts = open_menu(&mut stage);
+            assert!(
+                !click_merge(&mut stage, &texts),
+                "「{name}」时这一条该是点不动的，实际却开了窗"
+            );
+        }
+
+        // Git 目录：这一条不画，而不是画出来点不动
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs[0].bc_target = r"D:\dev\hrp".to_owned();
+        stage.app.dirs[0].local_diff = Some(summary(3));
+        stage.app.dirs[0].kind = crate::repo::RepoKind::Git;
+        let texts = open_menu(&mut stage);
+        assert!(
+            Stage::rect_of(&texts, "▲ 上移").is_some(),
+            "菜单要确实展开，不然这条断言是空的"
+        );
+        assert!(
+            Stage::rect_of(&texts, "双向合并（预览）").is_none(),
+            "Git 目录要的是分支合并，菜单里不该出现这一条"
+        );
     }
 
     /// 窗口认的是目录行下标，行序一变这个下标就指到别的目录上——「在 A 的规则框里改的却是 B」。

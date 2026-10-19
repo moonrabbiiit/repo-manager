@@ -124,8 +124,13 @@ pub fn stub_app(compact: bool) -> RepoApp {
         batch_label: None,
         rollback: None,
         resolve: None,
+        merge: None,
         commit_rules: None,
         show_settings: false,
+        show_plugins: false,
+        // 无头测试默认按「插件已装」跑：绝大多数界面测试关心的是入口本身，
+        // 「插件没装」的那几条自己把它置 false
+        plugin_present: Some(true),
         confirm_remove: None,
         auto_scroll: true,
         next_refresh: Instant::now(),

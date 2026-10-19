@@ -209,18 +209,19 @@ fn relative_to_root(full: &str, root: &Path) -> String {
     full.to_owned()
 }
 
-/// 弹窗里那一框是「一行一条」，而 `Excludes::parse` 认的是 BC 那套 `;` 分隔、`-` 前缀的写法。
-/// 这里把两种写法缝合起来，让屏蔽框里只写 `bin\`、`*.log` 就能生效，不必再抄一遍 `-`：
-/// 逐行去空白、丢空行与 `#` 注释与 `+`（包含模式本功能不支持，留着只会让人以为能写），
-/// 缺 `-` 的补上；不带 `.\` / `\` 锚定却带层级的裸路径（`A\B\target\`）补成 `./A\B\target\`，
+/// 弹窗里那一框是「一行一条」，而 `Excludes::parse` 认的是 BC 那套 `;` 分隔、带模式前缀的写法。
+/// 这里把两种写法缝合起来，让框里只写 `bin\`、`*.log` 就能生效，不必再抄一遍前缀：
+/// 逐行去空白、丢空行与 `#` 注释与另一种模式的行（包含与排除各存各的，混进来只会让人以为能写），
+/// 缺 `sign` 的补上；不带 `.\` / `\` 锚定却带层级的裸路径（`A\B\target\`）补成 `./A\B\target\`，
 /// 因为这种写法在 `Excludes` 里根本打不中——issue #4 就是栽在这条上。`;` 分隔的老写法照样认。
-fn normalize_excludes(raw: &str) -> String {
+fn normalize_rules(raw: &str, sign: char) -> String {
+    let opposite = if sign == '-' { '+' } else { '-' };
     let mut parts = Vec::new();
     for line in raw.split(['\n', '\r', ';']).map(str::trim) {
-        if line.is_empty() || line.starts_with('#') || line.starts_with('+') {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(opposite) {
             continue;
         }
-        let body = line.strip_prefix('-').unwrap_or(line).trim();
+        let body = line.strip_prefix(sign).unwrap_or(line).trim();
         if body.is_empty() {
             continue;
         }
@@ -236,9 +237,21 @@ fn normalize_excludes(raw: &str) -> String {
         } else {
             format!("./{body}")
         };
-        parts.push(format!("-{pattern}"));
+        parts.push(format!("{sign}{pattern}"));
     }
     parts.join(";")
+}
+
+/// 「屏蔽可提交项」与「不参与合并的文件」两格共用这套排除侧缝合规则：一行一条拼成 BC 的分号串、
+/// 补 `-` 前缀、丢掉 `+` 行
+pub(crate) fn normalize_excludes(raw: &str) -> String {
+    normalize_rules(raw, '-')
+}
+
+/// 「参与合并的文件」白名单走的是同一套缝合规则，只是前缀换成 `+`、`-` 行丢掉：
+/// 要挡东西是下面那格「不参与合并的文件」的职责，两格各管一边才说得清。
+pub(crate) fn normalize_includes(raw: &str) -> String {
+    normalize_rules(raw, '+')
 }
 
 /// `bc_filter` 在配置里是 BC 那套分号串（`-*.iml;-bin\`），弹窗里要一行一条：
@@ -1811,6 +1824,17 @@ mod tests {
         assert_eq!(normalize_excludes(r"-bin\;-.\auth.json"), r"-bin\;-.\auth.json");
     }
 
+    /// 白名单那格与屏蔽那格共用同一套缝合规则，只是前缀反过来：`-` 行在这一格同样形同没写，
+    /// 要挡东西得去上面那格——两格各管一边，才不会写出「以为挡住了其实没挡」的规则。
+    #[test]
+    fn normalize_includes_stitches_the_whitelist_box() {
+        assert_eq!(normalize_includes("*.zip"), "+*.zip", "裸写法补 `+`");
+        assert_eq!(normalize_includes("+*.zip"), "+*.zip", "已经带加号的不能变成 ++");
+        assert_eq!(normalize_includes(r"A\B\target\"), r"+./A\B\target\");
+        assert_eq!(normalize_includes("# 只合压缩包\n\n*.zip\n-bin\\\n"), "+*.zip");
+        assert!(normalize_includes("  \n#\n-\n").is_empty());
+    }
+
     /// 屏蔽只该挡住规则命中的那几条：单段目录名任意层级都算，根锚定的 `.\auth.json` 不能
     /// 带走子目录里的同名文件，裸多段路径补上锚定后深层同名目录也不该被误屏蔽。
     #[test]
@@ -2024,7 +2048,7 @@ mod tests {
         // 下一帧：提交页按新规则重算掩码，窗口预览与提交清单跟着同一个口径走
         let drawn = rules_frame(&ctx, &mut app, Vec::new());
         assert!(
-            has(&drawn, "当前命中 1 项：不进提交清单，提交页上也看不到"),
+            has(&drawn, "当前命中 1 项：不进入提交清单，提交页中亦不显示"),
             "{:?}",
             texts_of(&drawn)
         );
@@ -2078,6 +2102,285 @@ mod tests {
         let _ = rules_frame(&ctx, &mut app, vec![egui::Event::Text("logs\\".to_owned())]);
         assert_eq!(app.cfg.dirs[0].commit_excludes, "logs\\");
         assert!(app.cfg.dirs[0].bc_filter.is_empty(), "屏蔽规则不该写进 BC 筛选条件");
+    }
+
+    /// 第二页那两格是双向合并的白名单与黑名单：各写各的字段，既不许串到第一页两格，也不许互相串。
+    /// 更要紧的是这两格一个字都不该动提交口径——串了就是「以为只划了合并范围，其实把文件挡掉了提交」
+    #[test]
+    fn merge_scope_boxes_write_only_their_own_fields() {
+        let _appdata = crate::testbed::lock_appdata();
+        let appdata = std::env::temp_dir().join("repo_manager_merge_scope_dialog_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        let entries = vec![
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Unversioned, r"bin\tool.exe"),
+        ];
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(entries.clone());
+        app.commit = Some(page);
+        app.dirs[0].changed = Some(2);
+        app.dirs[0].all_changes = entries;
+        app.commit_rules = Some(crate::CommitRules::new(0, "-*.iml"));
+
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        // 两格在第二页：不点标签过去，画面上根本不该有它们
+        assert!(!has(&drawn, "参与合并的文件 · 存本目录配置"), "{:?}", texts_of(&drawn));
+        let mut tap = Vec::new();
+        pointer(&mut tap, rect_of(&drawn, "双向合并范围").center());
+        let _ = rules_frame(&ctx, &mut app, tap);
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        assert!(has(&drawn, "参与合并的文件 · 存本目录配置"), "{:?}", texts_of(&drawn));
+        assert!(has(&drawn, "不参与合并的文件 · 存本目录配置"), "{:?}", texts_of(&drawn));
+
+        // 白名单格：敲一行进去
+        let field = rect_containing(&drawn, "*.java").center();
+        let mut click = Vec::new();
+        pointer(&mut click, field);
+        let _ = rules_frame(&ctx, &mut app, click);
+        let _ = rules_frame(&ctx, &mut app, vec![egui::Event::Text("*.zip".to_owned())]);
+        assert_eq!(app.cfg.dirs[0].merge_include, "*.zip", "白名单那一格写的是 merge_include");
+        assert!(app.cfg.dirs[0].merge_exclude.is_empty(), "白名单不该顺手写黑名单");
+        assert_eq!(app.cfg.dirs[0].bc_filter, "-*.iml", "合并范围不该动差异口径");
+        assert!(app.cfg.dirs[0].commit_excludes.is_empty(), "合并范围不该动提交屏蔽");
+
+        // 黑名单格：敲一行进去
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        let field = rect_containing(&drawn, "*.min.js").center();
+        let mut click = Vec::new();
+        pointer(&mut click, field);
+        let _ = rules_frame(&ctx, &mut app, click);
+        let _ = rules_frame(&ctx, &mut app, vec![egui::Event::Text(r"target\".to_owned())]);
+        assert_eq!(app.cfg.dirs[0].merge_exclude, r"target\", "黑名单那一格写的是 merge_exclude");
+        assert_eq!(app.cfg.dirs[0].merge_include, "*.zip", "黑名单不该反过来改白名单");
+
+        let saved = std::fs::read_to_string(crate::config::config_file()).unwrap_or_default();
+        assert!(
+            saved.contains(r#""merge_include": "*.zip""#)
+                && saved.contains(r#""merge_exclude": "target\\""#),
+            "两格都写满了就得真的落盘：{saved}"
+        );
+
+        // 提交页一个字节都不该跟着变：两格只划合并范围，屏蔽计数与提交清单用的还是提交那一格
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        let page = app.commit.as_ref().unwrap();
+        assert_eq!(page.hidden_count(), 0, "{:?}", texts_of(&drawn));
+        assert_eq!(
+            page.commit_targets(),
+            vec![
+                r"D:\wc\src\main.java".to_owned(),
+                r"D:\wc\bin\tool.exe".to_owned()
+            ]
+        );
+    }
+
+    /// 四格竖着一列排时窗口要 658px 高，分作两页后每页实测 401px。这里锁三件事：每页只画得出
+    /// 属于它的那两格、切页整块换掉而窗口不跳高、切回去时先前敲的内容一个字都不丢。
+    #[test]
+    fn the_rules_window_splits_into_two_pages_of_the_same_height() {
+        let _appdata = crate::testbed::lock_appdata();
+        let appdata = std::env::temp_dir().join("repo_manager_rules_pages_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        app.cfg.dirs[0].commit_excludes = "logs\\".to_owned();
+        app.cfg.dirs[0].merge_include = "*.zip".to_owned();
+        app.commit_rules = Some(crate::CommitRules::new(0, "-*.iml"));
+
+        // 「这一页有多高」量的是窗口自己的内容：标题行顶到「确认」按钮底
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let span = |drawn: &[(String, egui::Rect)]| {
+            rect_of(drawn, "确认").max.y
+                - rect_containing(drawn, "差异过滤、提交屏蔽与合并范围").min.y
+        };
+        let page_names = |drawn: &[(String, egui::Rect)]| -> Vec<String> {
+            drawn
+                .iter()
+                .filter(|(text, _)| text.ends_with("· 存本目录配置"))
+                .map(|(text, _)| text.clone())
+                .collect()
+        };
+        let tap = |app: &mut RepoApp, name: &str| {
+            let drawn = rules_frame(&ctx, app, Vec::new());
+            let mut click = Vec::new();
+            pointer(&mut click, rect_of(&drawn, name).center());
+            let _ = rules_frame(&ctx, app, click);
+            rules_frame(&ctx, app, Vec::new())
+        };
+
+        let first = rules_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(
+            page_names(&first),
+            vec![
+                "差异比对过滤条件 · 存本目录配置".to_owned(),
+                "屏蔽可提交项 · 存本目录配置".to_owned()
+            ],
+            "{:?}",
+            texts_of(&first)
+        );
+        let height = span(&first);
+        assert!(height < 430.0, "一页只该有两格，实际高 {height:.0}px");
+
+        let second = tap(&mut app, "双向合并范围");
+        assert_eq!(
+            page_names(&second),
+            vec![
+                "参与合并的文件 · 存本目录配置".to_owned(),
+                "不参与合并的文件 · 存本目录配置".to_owned()
+            ],
+            "{:?}",
+            texts_of(&second)
+        );
+        assert!(
+            (span(&second) - height).abs() < 12.0,
+            "切页跳高就等于窗口在屏幕上抖：{} → {}",
+            height,
+            span(&second)
+        );
+        // 屏蔽规则在第一页、白名单在第二页，值都存在本目录配置里，切来切去不该丢
+        let back = tap(&mut app, "差异过滤与提交屏蔽");
+        assert!(has(&back, "屏蔽可提交项 · 存本目录配置"));
+        assert_eq!(app.cfg.dirs[0].commit_excludes, "logs\\");
+        assert_eq!(app.cfg.dirs[0].merge_include, "*.zip", "切页不许动另一页的规则");
+        assert_eq!(
+            app.commit_rules.as_ref().unwrap().filter_buf,
+            "-*.iml",
+            "过滤条件的行视图存在窗口状态里，切页回来还得是原样"
+        );
+    }
+
+    /// 标题栏那枚 ✕ 要真能把窗口关掉。叉不是文字，测试台取不到它，只能从这一帧画出的线段里
+    /// 把它认出来——顺带正好量到它的可点范围：出厂的 Heading 标题比叉高出一大截，叉却只有
+    /// `icon_width` 那一小点，指针落在标题带上就只是拖动窗口，看上去就是「点了没反应」。
+    /// 标题收到 14 之后，叉得基本占住标题那一行，这一条就是防它再被大标题架空。
+    #[test]
+    fn the_title_bar_cross_closes_the_rules_window() {
+        let _appdata = crate::testbed::lock_appdata();
+        let appdata = std::env::temp_dir().join("repo_manager_rules_cross_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        // 观感由 tune_style 定，而它在 RepoApp::new 里才调；测试自造的 ctx 得自己补一次，
+        // 否则量到的是出厂字号的标题栏，跟屏幕上看到的不是一个窗口
+        app.apply_accent(&ctx);
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        app.commit_rules = Some(crate::CommitRules::new(0, "-*.iml"));
+
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        let title = rect_containing(&drawn, "差异过滤、提交屏蔽与合并范围");
+        let mut out = ctx.run_ui(crate::testbed::base_input(), |ui| {
+            app.commit_page(ui);
+            app.commit_rules_dialog(ui.ctx());
+        });
+        out.textures_delta.clear();
+        let window = ctx
+            .memory(|m| m.area_rect(egui::Id::new("commit_rules")))
+            .expect("窗口应已登记在 area 里");
+        // 标题带里画出来的线段只有叉的那两笔
+        let cross = out
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::LineSegment { .. } => {
+                    let rect = item.shape.visual_bounding_rect();
+                    (rect.center().y < window.min.y + 30.0).then_some(rect)
+                }
+                _ => None,
+            })
+            .reduce(|a, b| a.union(b))
+            .expect("标题栏右上角应画出 ✕");
+
+        assert!(
+            cross.min.x > title.max.x && cross.max.y <= window.min.y + 40.0,
+            "叉要在标题带的最右端：叉 {cross:?}、标题 {title:?}、窗口顶 {}",
+            window.min.y
+        );
+        assert!(
+            cross.height() >= title.height() - 4.0,
+            "叉只有 {} 高，标题带却有 {} 高——点在标题带上只是拖窗口，等于没有出口",
+            cross.height(),
+            title.height()
+        );
+
+        let mut click = Vec::new();
+        pointer(&mut click, cross.center());
+        let _ = rules_frame(&ctx, &mut app, click);
+        assert!(app.commit_rules.is_none(), "点叉要把窗口收掉");
+        assert!(
+            !app.pool.has(crate::jobs::Kind::Refresh, 0),
+            "叉不是「确认」，关掉就好，不该起按新规则的重读"
+        );
+    }
+
+    /// 格子里写多写少不许动到整窗几何：同一个框摆两行和摆四十行，页面总高、「确认」离窗口
+    /// 右下角的那点距离都得一样——尺寸钉死在框上，写满只在框里滚。
+    #[test]
+    fn a_packed_rule_field_keeps_the_window_geometry() {
+        let _appdata = crate::testbed::lock_appdata();
+        let appdata = std::env::temp_dir().join("repo_manager_rules_packed_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.apply_accent(&ctx);
+        // 测试台量到的是「确认」二字的文字矩形，按钮框要比它外扩一圈 button_padding
+        let pad = ctx.style_of(egui::Theme::Dark).spacing.button_padding;
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        app.commit_rules = Some(crate::CommitRules::new(0, "-*.iml\n-*.log"));
+
+        // 都以窗口自己的矩形为参照：窗口头两帧还在校准居中位置，位置会挪而尺寸不会
+        let measure = |app: &mut RepoApp| {
+            let _ = rules_frame(&ctx, app, Vec::new());
+            let drawn = rules_frame(&ctx, app, Vec::new());
+            let window = ctx
+                .memory(|m| m.area_rect(egui::Id::new("commit_rules")))
+                .unwrap();
+            let confirm = rect_of(&drawn, "确认");
+            let page = (
+                confirm.max.y - rect_containing(&drawn, "差异过滤、提交屏蔽与合并范围").min.y,
+                window.max.y - confirm.max.y,
+                window.max.x - confirm.max.x,
+            );
+            (page, texts_of(&drawn))
+        };
+
+        let (sparse, texts) = measure(&mut app);
+        app.commit_rules.as_mut().unwrap().filter_buf = (0..40)
+            .map(|i| format!("-src/module{i}/some/long/package/ServiceImpl.java"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (packed, _) = measure(&mut app);
+
+        for (name, a, b) in [
+            ("页高", sparse.0, packed.0),
+            ("离底", sparse.1, packed.1),
+            ("离右", sparse.2, packed.2),
+        ] {
+            assert!((a - b).abs() < 0.5, "灌满四十行后{name}变了：{a:.1} → {b:.1}｜{texts:?}");
+        }
+        // 测试台量到的是「确认」二字的文字矩形，按钮框还要再往外扩一圈 button_padding
+        let (right, bottom) = (sparse.2 - pad.x, sparse.1 - pad.y);
+        assert!(
+            right <= 8.0 && bottom <= 8.0,
+            "「确认」得贴在窗口右下角：按钮框离右 {right:.1}、离底 {bottom:.1}"
+        );
     }
 
     /// 「确认」是这扇窗的出口：按下要关窗，并按刚写下的规则重读本目录（起 Refresh 任务，

@@ -184,43 +184,46 @@ impl RepoApp {
                     self.hint("已在默认浏览器打开 GitHub 的 issue 页面");
                 }
 
-                // AI 日志：开关式入口。开着时图标常亮主色；数量进悬停提示。
-                // 第一次点开启「日志模式」（各目录提交记录页里本人提交的版本行出现勾选框）；
-                // 开着但没勾选时再点退出；有勾选后点击弹出「AI 工作日志」窗口（模式保持
-                // 开启，方便关掉窗口后去别的目录继续勾）。
-                let picks = self.ai_picks.len();
-                let (ai_hover, ai_active) = if !self.ai_mode {
-                    (
-                        "开启日志模式：各目录「提交记录」页中本人提交的版本行将出现勾选框，\n\
-                         勾选后本按钮亮起，点击弹出「AI 工作日志」窗口"
-                            .to_owned(),
-                        false,
-                    )
-                } else if picks == 0 {
-                    (
-                        "已开启日志模式：提交记录页显示勾选框（已勾选的提交将保留），点击退出"
-                            .to_owned(),
-                        true,
-                    )
-                } else {
-                    (
-                        format!(
-                            "打开「AI 工作日志」窗口：将已勾选的 {picks} 条提交交由 AI，\
-                             按「口吻」整理为工作日志（模式保持开启，可继续在其他目录勾选）"
-                        ),
-                        true,
-                    )
-                };
-                let ai_tint = ai_active.then_some(ui.visuals().hyperlink_color);
-                let ai = icons::button(ui, &set.ai_log, &ai_hover, TOOL_SIZE, false, ai_tint);
-                buttons_left = buttons_left.min(ai.rect.min.x);
-                if ai.clicked() {
-                    if !self.ai_mode {
-                        self.ai_mode = true;
+                // 插件没装时整块不画：日志模式、勾选框、窗口都跟着消失
+                if self.plugin_installed(crate::plugins::PluginId::AiLog) {
+                    // AI 日志：开关式入口。开着时图标常亮主色；数量进悬停提示。
+                    // 第一次点开启「日志模式」（各目录提交记录页里本人提交的版本行出现勾选框）；
+                    // 开着但没勾选时再点退出；有勾选后点击弹出「AI 工作日志」窗口（模式保持
+                    // 开启，方便关掉窗口后去别的目录继续勾）。
+                    let picks = self.ai_picks.len();
+                    let (ai_hover, ai_active) = if !self.ai_mode {
+                        (
+                            "开启日志模式：各目录「提交记录」页中本人提交的版本行将出现勾选框，\n\
+                             勾选后本按钮亮起，点击弹出「AI 工作日志」窗口"
+                                .to_owned(),
+                            false,
+                        )
                     } else if picks == 0 {
-                        self.ai_mode = false;
+                        (
+                            "已开启日志模式：提交记录页显示勾选框（已勾选的提交将保留），点击退出"
+                                .to_owned(),
+                            true,
+                        )
                     } else {
-                        self.show_worklog = true;
+                        (
+                            format!(
+                                "打开「AI 工作日志」窗口：将已勾选的 {picks} 条提交交由 AI，\
+                                 按「口吻」整理为工作日志（模式保持开启，可继续在其他目录勾选）"
+                            ),
+                            true,
+                        )
+                    };
+                    let ai_tint = ai_active.then_some(ui.visuals().hyperlink_color);
+                    let ai = icons::button(ui, &set.ai_log, &ai_hover, TOOL_SIZE, false, ai_tint);
+                    buttons_left = buttons_left.min(ai.rect.min.x);
+                    if ai.clicked() {
+                        if !self.ai_mode {
+                            self.ai_mode = true;
+                        } else if picks == 0 {
+                            self.ai_mode = false;
+                        } else {
+                            self.show_worklog = true;
+                        }
                     }
                 }
 
@@ -261,6 +264,25 @@ impl RepoApp {
                     self.persist();
                 }
 
+                // 插件面板：独立入口，装了哪个插件就在面板里管哪个
+                let plugins_open = self.show_plugins;
+                let plugins = icons::button(
+                    ui,
+                    &set.plugins,
+                    if plugins_open {
+                        "收起“插件”面板"
+                    } else {
+                        "打开“插件”面板：安装或卸载可选功能模块"
+                    },
+                    TOOL_SIZE,
+                    false,
+                    plugins_open.then_some(ui.visuals().hyperlink_color),
+                );
+                buttons_left = buttons_left.min(plugins.rect.min.x);
+                if plugins.clicked() {
+                    self.show_plugins = !self.show_plugins;
+                }
+
                 let settings = icons::button(ui, &set.settings, "设置", TOOL_SIZE, false, None);
                 buttons_left = buttons_left.min(settings.rect.min.x);
                 if settings.clicked() {
@@ -293,10 +315,18 @@ mod tests {
     /// 顶栏单独跑一帧（贴图齐全、挂着一条新版本提示），收下这一帧画出来的文字与图片数。
     /// 测试里没有渲染器，字体增量不应用就得显式丢弃，否则 epaint 在 Drop 时 panic
     fn header_frame(dark: bool) -> (Vec<String>, usize) {
+        header_frame_with(dark, None)
+    }
+
+    /// 同 `header_frame`，但可以指定「插件装没装」（None = 用测试桩的默认值）
+    fn header_frame_with(dark: bool, plugin_present: Option<bool>) -> (Vec<String>, usize) {
         let ctx = egui::Context::default();
         ctx.set_theme(if dark { ThemePreference::Dark } else { ThemePreference::Light });
         crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = stub_app(false);
+        if let Some(present) = plugin_present {
+            app.plugin_present = Some(present);
+        }
         app.update_ready = true;
         app.icons = Some(crate::icons::IconSet::load(&ctx));
         let mut out = ctx.run_ui(
@@ -325,7 +355,7 @@ mod tests {
     }
 
     /// 右上角那一排文字按钮全部换成了 SVG 图标：旧文案不该再以按钮形式出现，
-    /// 图标键（工具 5 + 窗口控制 3 + 新版本 1）一枚不少
+    /// 图标键（工具 6 + 窗口控制 3 + 新版本 1）一枚不少
     #[test]
     fn top_right_buttons_are_all_icons_now() {
         let (texts, images) = header_frame(true);
@@ -335,7 +365,19 @@ mod tests {
                 "顶栏还有文字按钮「{label}」：{texts:?}"
             );
         }
-        assert!(images >= 9, "顶栏该有 9 枚图标键，只画了 {images}");
+        assert!(images >= 10, "顶栏该有 10 枚图标键，只画了 {images}");
+    }
+
+    /// AI 日志插件没装时，顶栏那枚图标整块不画（不是点下去才提示）
+    #[test]
+    fn the_ai_log_button_disappears_with_its_plugin() {
+        let (_, with_plugin) = header_frame(true);
+        let (_, without) = header_frame_with(true, Some(false));
+        assert_eq!(
+            with_plugin as i64 - without as i64,
+            1,
+            "未装 AI 日志插件时顶栏应正好少一枚图标（装 {with_plugin} / 未装 {without}）"
+        );
     }
 
     /// 天区写给原生侧的数值得合理：顶栏有高度、按钮区左缘落在窗口里，

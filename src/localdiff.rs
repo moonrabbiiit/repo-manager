@@ -4,7 +4,7 @@
 //!
 //! 判定不跟修改时间、也不跟字节数较真：BC 从服务器端合到本地端时是否保留时间戳取决于
 //! 本机 BC 设置，而 BOM（3 字节）、CRLF 与 LF 之差都能只改字节数不改内容。所以只有
-//! 「大小和时间戳都一样」才直接算一致，其余一律读内容，并按 BC 默认的忽略规则把
+//! 每一对文件都读内容核对，并按 BC 默认的忽略规则把
 //! 只差 BOM / 行尾 / 行尾空白 / 末尾换行的那批算成一致（实测旧系统后端 548 项里
 //! 541 项属于这一类：508 个 BOM、19 个行尾、14 个行尾空白或末尾换行，主页的数
 //! 因此从 548 收到 6，和 BC 窗口里看到的那几项对上）。
@@ -26,9 +26,9 @@ pub const SAMPLE_MAX: usize = 50;
 /// 主页的数就成了随手可漏的下界（实测易朋云 HRP.SR 一个真改了内容的 mapper xml 就这么漏掉）。
 /// 比对在后台线程跑、行上只有转圈标记，不占界面也不锁操作，跑得久只是这个数晚点到。
 /// `max_files` 是防失控的兜底（正常工程树到不了这个量级），不是工作上限。
-struct Limits {
-    max_files: usize,
-    max_time: Duration,
+pub(crate) struct Limits {
+    pub max_files: usize,
+    pub max_time: Duration,
 }
 
 impl Default for Limits {
@@ -125,70 +125,100 @@ impl Excludes {
     /// `+` 前缀和无前缀的包含模式这里不支持：差异口径要和他用同一份筛选打开的 BC 对得上，
     /// 而 BC 那边包含条件是记在会话里的，我们只有这份排除串。
     pub fn parse(raw: &str) -> Self {
-        let mut out = Self::default();
+        parse_sign(raw, '-', true)
+    }
+
+    /// 「参与合并的文件」白名单：写法与 `bc_filter` 同一套（`;` 或换行分隔、`*` 与 `?` 通配、
+    /// 结尾 `\` 是目录、`.\` 锚定根目录），只是前缀换成 `+`，裸写 `*.java` 就当成 `+*.java`。
+    /// 复用同一套四桶与匹配器：白名单判的是「哪些路径参与」，与排除互为反义，另造一个匹配器
+    /// 只会让两边的写法口径漂开。
+    /// 这里**不**加 `.svn` / `.git` 那套硬项——`hits()` 在白名单里的含义反过来了，
+    /// 加进去等于宣布「工作副本元数据参与合并」。
+    pub fn parse_includes(raw: &str) -> Self {
+        parse_sign(raw, '+', false)
+    }
+}
+
+/// `sign` 是这一串的模式前缀（排除 `-`、包含 `+`），`hard` 表示是否叠上内置的硬排除项
+fn parse_sign(raw: &str, sign: char, hard: bool) -> Excludes {
+    let mut out = Excludes::default();
+    if hard {
         // 工作副本的元数据目录永远不参与比较：svn 的 .svn 只在服务器端、git 的 .git 只在
         // 本地端，算进去会把整个工作副本的文件数都当成单侧缺失
         out.dirs.push(".svn".to_owned());
         out.dirs.push(".git".to_owned());
-        for item in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let Some(pattern) = item.strip_prefix('-') else { continue };
-            let pattern = pattern.trim();
-            if pattern.is_empty() {
-                continue;
-            }
-            // `.\名字`（BC 面板里填 `.\xxx` 的写法）和 `\名字` 都锚定根目录；
-            // 相对路径统一按 `/` 存，和 walk 产出的 rel 一致
-            let (root_only, pattern) = match pattern
-                .strip_prefix(".\\")
-                .or_else(|| pattern.strip_prefix("./"))
-                .or_else(|| pattern.strip_prefix('\\'))
-            {
-                Some(rest) => (true, rest),
-                None => (false, pattern),
-            };
-            let pattern = pattern.replace('\\', "/");
-            // 结尾的 `/` 是 BC 里「目录名」的写法：锚定根目录时整段按相对路径算，
-            // 不锚定时取末级名在任意层级命中；带通配符的分别进对应的 glob 列表
-            if let Some(dir) = pattern.strip_suffix('/') {
-                if root_only {
-                    let path = dir.trim_matches('/').to_ascii_lowercase();
-                    if path.is_empty() {
-                        continue;
-                    }
-                    // 根锚定的目录一律编译成「整段路径」正则：单段的 `.\out\` 只命中根上的
-                    // out，多段的 `.\HRP.Web\build\` 也不必再靠 at_root 判定——多段路径的
-                    // rel 必然带 `/`，靠 at_root 就永远打不中（本机 biaozhunword 的
-                    // build/classes、springbootWork 的 Infrastructure\Model\target 就是
-                    // 这么被漏成 121 / 4519 条「只在本地开发侧」的）
-                    if let Some(re) = root_dir_glob_regex(&path) {
-                        out.root_dir_globs.push(re);
-                    }
-                } else {
-                    let name = dir.rsplit('/').next().unwrap_or("").trim_matches('/');
-                    if !name.is_empty() {
-                        let name = name.to_ascii_lowercase();
-                        if name.contains('*') || name.contains('?') {
-                            if let Some(re) = glob_to_regex(&name) {
-                                out.dir_globs.push(re);
-                            }
-                        } else {
-                            out.dirs.push(name);
+        // 合并落盘用的临时文件：一次崩掉的 apply 会在目录里留下 `.repomanager-merge-tmp-*`，
+        // 不硬排除就永远算成「只在本地开发侧」，把「本地无差异」永久弄脏
+        if let Some(re) = Regex::new(r"^\.repomanager-merge-(tmp|recovery)-").ok() {
+            out.files.push(re);
+        }
+    }
+    for item in raw.split([';', '\n', '\r']).map(str::trim).filter(|s| !s.is_empty() && !s.starts_with('#')) {
+        let pattern = match item.strip_prefix(sign) {
+            Some(rest) => rest,
+            // 白名单里裸写法就是包含；排除串里不带 `-` 的行是他从 BC 面板粘来的包含条件，
+            // 本口径不认（理由见 `Excludes::parse` 的注释）
+            None if sign == '+' => item,
+            None => continue,
+        };
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        // `.\名字`（BC 面板里填 `.\xxx` 的写法）和 `\名字` 都锚定根目录；
+        // 相对路径统一按 `/` 存，和 walk 产出的 rel 一致
+        let (root_only, pattern) = match pattern
+            .strip_prefix(".\\")
+            .or_else(|| pattern.strip_prefix("./"))
+            .or_else(|| pattern.strip_prefix('\\'))
+        {
+            Some(rest) => (true, rest),
+            None => (false, pattern),
+        };
+        let pattern = pattern.replace('\\', "/");
+        // 结尾的 `/` 是 BC 里「目录名」的写法：锚定根目录时整段按相对路径算，
+        // 不锚定时取末级名在任意层级命中；带通配符的分别进对应的 glob 列表
+        if let Some(dir) = pattern.strip_suffix('/') {
+            if root_only {
+                let path = dir.trim_matches('/').to_ascii_lowercase();
+                if path.is_empty() {
+                    continue;
+                }
+                // 根锚定的目录一律编译成「整段路径」正则：单段的 `.\out\` 只命中根上的
+                // out，多段的 `.\HRP.Web\build\` 也不必再靠 at_root 判定——多段路径的
+                // rel 必然带 `/`，靠 at_root 就永远打不中（本机 biaozhunword 的
+                // build/classes、springbootWork 的 Infrastructure\Model\target 就是
+                // 这么被漏成 121 / 4519 条「只在本地开发侧」的）
+                if let Some(re) = root_dir_glob_regex(&path) {
+                    out.root_dir_globs.push(re);
+                }
+            } else {
+                let name = dir.rsplit('/').next().unwrap_or("").trim_matches('/');
+                if !name.is_empty() {
+                    let name = name.to_ascii_lowercase();
+                    if name.contains('*') || name.contains('?') {
+                        if let Some(re) = glob_to_regex(&name) {
+                            out.dir_globs.push(re);
                         }
+                    } else {
+                        out.dirs.push(name);
                     }
                 }
-                continue;
             }
-            if let Some(re) = glob_to_regex(&pattern) {
-                if root_only {
-                    out.root_files.push(re);
-                } else {
-                    out.files.push(re);
-                }
+            continue;
+        }
+        if let Some(re) = glob_to_regex(&pattern) {
+            if root_only {
+                out.root_files.push(re);
+            } else {
+                out.files.push(re);
             }
         }
-        out
     }
+    out
+}
 
+impl Excludes {
     /// 扁平清单版的排除判定：给一条相对根目录的路径，判它自己或它的任一级父目录是否被排除。
     /// `walk()` 走的是递归剪枝，提交页拿到的是「一条一条状态条目」、没有目录树可剪，所以自己
     /// 逐级认父段。条目到底是文件还是目录 `StatusEntry` 没带，末级段就两种身份各试一次：
@@ -270,11 +300,55 @@ fn glob_body(pattern: &str) -> String {
     body
 }
 
+/// 一侧目录里的一个文件：rel 相对各自的根、统一 `/` 分隔，大小写按磁盘上的原样
 #[derive(Clone)]
-struct Entry {
-    rel: String,
-    size: u64,
-    modified: u64,
+pub(crate) struct Side {
+    pub rel: String,
+    pub size: u64,
+    pub modified: u64,
+}
+
+/// 一对文件的判定结论。内容核对完成才可计为一致。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// 读了内容，一模一样
+    Same,
+    /// 只差 BOM / 行尾 / 行尾空白 / 末尾换行，Beyond Compare 口径算一致
+    Trivial,
+    /// 真不一样
+    Different,
+    OnlyLocal,
+    OnlyServer,
+    /// 该读内容但预算用满，没读
+    Unverified,
+}
+
+/// 一条配对结果。两侧都在时 `local` / `server` 各装自己那一份元数据：配对按小写路径做，
+/// 磁盘上的写法可以只差大小写，读写文件时必须各走各的 rel。
+pub(crate) struct Pair {
+    /// 配对键：小写的相对路径，两侧共用
+    pub key: String,
+    pub local: Option<Side>,
+    pub server: Option<Side>,
+    pub verdict: Verdict,
+}
+
+impl Pair {
+    /// 清单与报告上显示的路径：本地端的写法优先（用户看的是自己那棵树）
+    pub fn display(&self) -> &str {
+        match (&self.local, &self.server) {
+            (Some(side), _) | (None, Some(side)) => &side.rel,
+            (None, None) => &self.key,
+        }
+    }
+}
+
+/// 一次全树核对的产物：主页的计数 + 逐项清单
+pub(crate) struct Scan {
+    pub items: Vec<Pair>,
+    pub summary: Summary,
+    /// 真读过内容且一模一样的对数。
+    pub same_by_content: usize,
 }
 
 /// 按默认预算比较两个目录。任一侧不是可读目录时返回 Err（主页宁可什么都不显示，
@@ -284,6 +358,32 @@ pub fn compare(local: &Path, server: &Path, filter: &str) -> Result<Summary, Str
 }
 
 fn compare_with(local: &Path, server: &Path, filter: &str, limits: &Limits) -> Result<Summary, String> {
+    pairs_with(local, server, filter, limits).map(|scan| scan.summary)
+}
+
+/// 两棵树各走一遍、按小写 rel 配对，产出逐项清单和主页计数。
+///
+/// 主页只要 `Summary`，诊断报告和双向合并要的是 `items`：`Summary` 只带封顶 50 条抽样，
+/// 拿它当合并输入等于只合 50 个文件却宣称合完了。计数口径只有这一份实现，
+/// 三条出口（主页 / 报告 / 合并）才不会对不上号。
+///
+/// `items` 按配对键排序。`Unverified` 不进清单（判都没判出来，不参与报告也不参与合并）；
+/// `Same` / `Trivial` 各只留前 `LISTING_MAX` 条，那是给诊断报告列举用的额度。
+pub(crate) fn pairs_with(
+    local: &Path,
+    server: &Path,
+    filter: &str,
+    limits: &Limits,
+) -> Result<Scan, String> {
+    pairs_impl(local, server, filter, limits, false)
+}
+
+/// 合并不能依赖时间戳捷径，也不能把未能枚举的目录误认成删除。
+pub(crate) fn pairs_for_merge(local: &Path, server: &Path, filter: &str, limits: &Limits) -> Result<Scan, String> {
+    pairs_impl(local, server, filter, limits, true)
+}
+
+fn pairs_impl(local: &Path, server: &Path, filter: &str, limits: &Limits, strict: bool) -> Result<Scan, String> {
     if !local.is_dir() {
         return Err(format!("本地开发侧目录读不到：{}", local.display()));
     }
@@ -295,80 +395,116 @@ fn compare_with(local: &Path, server: &Path, filter: &str, limits: &Limits) -> R
 
     // 只给服务器端建表，走本地端时逐条摘走，剩下自然就是「仅服务器端」——
     // 一棵表比两棵省一半内存，也少一次全树 stat
-    let mut index: HashMap<String, Entry> = HashMap::new();
-    walk(server, server, &ex, 0, &mut |rel, size, modified| {
-        index.insert(rel.to_ascii_lowercase(), Entry { rel: rel.to_owned(), size, modified });
-    });
+    let mut index: HashMap<String, Side> = HashMap::new();
+    walk_checked(server, server, &ex, 0, strict, &mut |rel, size, modified| {
+        index.insert(rel.to_ascii_lowercase(), Side { rel: rel.to_owned(), size, modified });
+    })?;
 
     let mut summary = Summary::default();
+    let mut items: Vec<Pair> = Vec::new();
     let mut verified = 0usize;
-    // 抽样分两堆：内容不同的排前面，单侧缺失的排后面——上万的单侧缺失不该把
-    // 真差异挤出抽样上限（issue #3：50 条抽样全是 bin 构建产物，真差异翻不到）
-    let mut diff_samples: Vec<String> = Vec::new();
-    let mut other_samples: Vec<String> = Vec::new();
+    let mut same_by_content = 0usize;
+    let (mut same_left, mut trivial_left) = (LISTING_MAX, LISTING_MAX);
     let local_owned = local.to_owned();
-    walk(local, local, &ex, 0, &mut |rel, size, modified| {
+    let server_owned = server.to_owned();
+    walk_checked(local, local, &ex, 0, strict, &mut |rel, size, modified| {
         let key = rel.to_ascii_lowercase();
-        let matched = index.remove(&key);
-        let Some(entry) = matched else {
+        let mine = Side { rel: rel.to_owned(), size, modified };
+        let Some(theirs) = index.remove(&key) else {
             summary.only_local += 1;
-            push_capped(&mut other_samples, rel);
+            items.push(Pair { key, local: Some(mine), server: None, verdict: Verdict::OnlyLocal });
             return;
         };
-        if entry.size == size && entry.modified == modified {
-            // 大小、时间戳都一样就不读文件：这是两万多半秒走完的关键。BC 合过的文件
-            // 时间戳会变，落不进这一档，交给下面的核对
-            summary.same += 1;
-            return;
-        }
-        // 大小不同也不等于改了：BOM 是 3 字节、一行 CRLF 变 LF 是 1 字节，
-        // 所以到这一步只有读内容才算数
-        if verified >= limits.max_files || start.elapsed() > limits.max_time {
+        let verdict = if verified >= limits.max_files || start.elapsed() > limits.max_time {
+            // 大小不同也不等于改了：BOM 是 3 字节、一行 CRLF 变 LF 是 1 字节，
+            // 所以到这一步只有读内容才算数；预算用满了就只能记成未核对
             summary.unverified += 1;
-            return;
-        }
-        verified += 1;
-        match verify(&local_owned.join(rel), &server.join(&entry.rel)) {
-            Content::Same => summary.same += 1,
-            Content::Equivalent => summary.trivial += 1,
-            Content::Different => {
-                summary.differing += 1;
-                push_capped(&mut diff_samples, rel);
+            Verdict::Unverified
+        } else {
+            verified += 1;
+            match verify(&local_owned.join(rel), &server_owned.join(&theirs.rel)) {
+                Content::Same => {
+                    summary.same += 1;
+                    same_by_content += 1;
+                    Verdict::Same
+                }
+                Content::Equivalent => {
+                    summary.trivial += 1;
+                    Verdict::Trivial
+                }
+                Content::Different => {
+                    summary.differing += 1;
+                    Verdict::Different
+                }
             }
+        };
+        let keep = match verdict {
+            Verdict::Different => true,
+            Verdict::Same | Verdict::Trivial if strict => true,
+            Verdict::Same if same_left > 0 => {
+                same_left -= 1;
+                true
+            }
+            Verdict::Trivial if trivial_left > 0 => {
+                trivial_left -= 1;
+                true
+            }
+            _ => false,
+        };
+        if keep {
+            items.push(Pair { key, local: Some(mine), server: Some(theirs), verdict });
         }
-    });
+    })?;
 
     summary.only_server = index.len();
-    for entry in index.values() {
-        push_capped(&mut other_samples, &entry.rel);
+    for (key, side) in index {
+        items.push(Pair { key, local: None, server: Some(side), verdict: Verdict::OnlyServer });
     }
-    diff_samples.sort();
-    other_samples.sort();
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+
+    // 抽样分两堆：内容不同的排前面，单侧缺失的排后面——上万的单侧缺失不该把
+    // 真差异挤出抽样上限（issue #3：50 条抽样全是 bin 构建产物，真差异翻不到）
+    let (mut diff_samples, mut other_samples): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for item in &items {
+        match item.verdict {
+            Verdict::Different => diff_samples.push(item.display()),
+            Verdict::OnlyLocal | Verdict::OnlyServer => other_samples.push(item.display()),
+            _ => {}
+        }
+    }
     summary.samples = diff_samples
         .into_iter()
         .chain(other_samples)
         .take(SAMPLE_MAX)
+        .map(str::to_owned)
         .collect();
-    Ok(summary)
-}
-
-fn push_capped(list: &mut Vec<String>, rel: &str) {
-    if list.len() < SAMPLE_MAX {
-        list.push(rel.to_owned());
-    }
+    Ok(Scan { items, summary, same_by_content })
 }
 
 /// 递归走一棵树，把每个没被筛选排除的文件交给 sink（相对路径以 root 为基准、统一 `/` 分隔，
 /// 大小写按磁盘上的原样）。目录名与文件名都过筛选——BC 的名称筛选本来就同时作用在两侧，
 /// 一个名叫 `foo.iml` 的目录留着也会带出一堆无关差异。
-fn walk(root: &Path, dir: &Path, ex: &Excludes, depth: usize, sink: &mut dyn FnMut(&str, u64, u64)) {
+fn walk_checked(root: &Path, dir: &Path, ex: &Excludes, depth: usize, strict: bool, sink: &mut dyn FnMut(&str, u64, u64)) -> Result<(), String> {
     if depth > MAX_DEPTH {
-        return;
+        return if strict { Err(format!("目录层级超过上限，无法完整扫描：{}", dir.display())) } else { Ok(()) };
     }
-    let Ok(read) = fs::read_dir(dir) else { return };
-    for item in read.flatten() {
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) if strict => return Err(format!("无法完整扫描 {}：{e}", dir.display())),
+        Err(_) => return Ok(()),
+    };
+    for item in read {
+        let item = match item {
+            Ok(item) => item,
+            Err(e) if strict => return Err(format!("枚举 {} 失败：{e}", dir.display())),
+            Err(_) => continue,
+        };
         let name = item.file_name().to_string_lossy().into_owned();
-        let Ok(file_type) = item.file_type() else { continue };
+        let file_type = match item.file_type() {
+            Ok(kind) => kind,
+            Err(e) if strict => return Err(format!("读取 {} 类型失败：{e}", item.path().display())),
+            Err(_) => continue,
+        };
         let child = item.path();
         let Ok(rest) = child.strip_prefix(root) else { continue };
         let rel = rest.display().to_string().replace('\\', "/");
@@ -376,12 +512,19 @@ fn walk(root: &Path, dir: &Path, ex: &Excludes, depth: usize, sink: &mut dyn FnM
             if ex.skips_dir(&name, &rel) {
                 continue;
             }
-            walk(root, &child, ex, depth + 1, sink);
+            walk_checked(root, &child, ex, depth + 1, strict, sink)?;
         } else if file_type.is_file() && !ex.skips_file(&name, &rel) {
-            let Ok(meta) = item.metadata() else { continue };
+            let meta = match item.metadata() {
+                Ok(meta) => meta,
+                Err(e) if strict => return Err(format!("读取 {} 属性失败：{e}", child.display())),
+                Err(_) => continue,
+            };
             sink(&rel, meta.len(), mtime_secs(&meta));
+        } else if strict && file_type.is_symlink() && !ex.skips_file(&name, &rel) && !ex.skips_dir(&name, &rel) {
+            return Err(format!("合并范围内存在符号链接，无法安全扫描：{}", child.display()));
         }
     }
+    Ok(())
 }
 
 /// 修改时间取整秒。复制工具写回的亚秒精度不一定和源文件一致，按秒比才把「同一时刻」
@@ -406,7 +549,31 @@ enum Content {
 
 /// 超过这个大小只做逐字节比较，不整读进内存做归一化：文本文件到不了这个量级，
 /// 而大文件里真改了的字节也不该被 BOM 那套规则洗掉
-const NORMALIZE_MAX: u64 = 16 * 1024 * 1024;
+pub(crate) const NORMALIZE_MAX: u64 = 16 * 1024 * 1024;
+
+pub(crate) fn read_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("文件超过读取上限 {limit} 字节")));
+    }
+    Ok(bytes)
+}
+
+/// 逐行生成比较键，不为上百万个空行分配行表和归一化副本。
+pub(crate) fn normalized_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    std::iter::from_fn(move || {
+        if rest.is_empty() { return None }
+        let end = rest.iter().position(|b| matches!(b, b'\r' | b'\n')).unwrap_or(rest.len());
+        let line = &rest[..end];
+        let skip = if rest.get(end) == Some(&b'\r') && rest.get(end + 1) == Some(&b'\n') { 2 }
+            else { usize::from(end < rest.len()) };
+        rest = &rest[end + skip..];
+        let kept = line.iter().rposition(|b| !matches!(b, b' ' | b'\t' | 0x0B | 0x0C)).map_or(0, |i| i + 1);
+        Some(&line[..kept])
+    })
+}
 
 fn verify(a: &Path, b: &Path) -> Content {
     if same_content(a, b) {
@@ -416,13 +583,13 @@ fn verify(a: &Path, b: &Path) -> Content {
     if big(a) || big(b) {
         return Content::Different;
     }
-    let (Ok(x), Ok(y)) = (fs::read(a), fs::read(b)) else {
+    let (Ok(x), Ok(y)) = (read_limited(a, NORMALIZE_MAX), read_limited(b, NORMALIZE_MAX)) else {
         return Content::Different;
     };
     if !looks_text(&x) || !looks_text(&y) {
         return Content::Different;
     }
-    if normalize(&x) == normalize(&y) {
+    if normalized_lines(&x).eq(normalized_lines(&y)) {
         Content::Equivalent
     } else {
         Content::Different
@@ -431,36 +598,8 @@ fn verify(a: &Path, b: &Path) -> Content {
 
 /// 前 8KB 里没有 NUL 就当文本看（和 BC 只对文本套用忽略规则同理），
 /// 二进制文件里恰好出现 `0D 0A` 不该被当成换行折掉
-fn looks_text(bytes: &[u8]) -> bool {
+pub(crate) fn looks_text(bytes: &[u8]) -> bool {
     !bytes[..bytes.len().min(8 * 1024)].contains(&0)
-}
-
-/// 去掉 UTF-8 BOM、把 CRLF / CR 折成 LF、去掉每行行尾的空格与制表符，末尾多一个少一个
-/// 换行也不算差异——这几条就是 BC 默认的忽略规则。结尾空行仍算差异，BC 会报出来。
-fn normalize(bytes: &[u8]) -> Vec<u8> {
-    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    let mut lf = Vec::with_capacity(body.len());
-    let mut i = 0;
-    while i < body.len() {
-        if body[i] == b'\r' {
-            lf.push(b'\n');
-            i += usize::from(body.get(i + 1) == Some(&b'\n'));
-        } else {
-            lf.push(body[i]);
-        }
-        i += 1;
-    }
-    let mut lines: Vec<&[u8]> = lf
-        .split(|b| *b == b'\n')
-        .map(|line| match line.iter().rposition(|b| !matches!(b, b' ' | b'\t' | 0x0B | 0x0C)) {
-            Some(kept) => &line[..=kept],
-            None => &line[..0],
-        })
-        .collect();
-    if lines.last() == Some(&&[][..]) {
-        lines.pop();
-    }
-    lines.join(&b'\n')
 }
 
 /// 分块读字节比内容，遇到第一个差异字节就退出。不引哈希依赖（项目里唯一的哈希是
@@ -516,7 +655,7 @@ const HEX_PER_LINE: usize = 16;
 
 /// 单个文件的诊断结论。
 enum Inspect {
-    /// 字节完全一样，只是大小或修改时间对不上
+    /// 已逐字节核对，内容完全一样。
     Same,
     /// 只差 BOM / 行尾 / 行尾空白 / 末尾换行（BC 口径算一致）
     Equivalent(String),
@@ -534,85 +673,55 @@ enum Inspect {
 /// 两棵树都再走一遍，把判定逐项展开成报告文本。
 /// 和 `compare` 用同一套筛选与预算，所以数字能对得上主页。
 pub fn diagnose(local: &Path, server: &Path, filter: &str) -> Result<String, String> {
-    if !local.is_dir() {
-        return Err(format!("本地开发侧目录读不到：{}", local.display()));
-    }
-    if !server.is_dir() {
-        return Err(format!("服务器端目录读不到：{}", server.display()));
-    }
-    let ex = Excludes::parse(filter);
     let start = Instant::now();
+    let scan = pairs_with(local, server, filter, &Limits::default())?;
+    let counts = scan.summary;
 
-    let mut index: HashMap<String, Entry> = HashMap::new();
-    walk(server, server, &ex, 0, &mut |rel, size, modified| {
-        index.insert(rel.to_ascii_lowercase(), Entry { rel: rel.to_owned(), size, modified });
-    });
-
+    // 逐项展开只对清单里那批再做一次深判（第一个差异字节、行摘录、归一化到哪一步才打平）：
+    // 全树只跑一遍轻量核对，报告的开销不跟着树的大小涨
     let mut differing: Vec<(String, u64, u64, u64, u64, Inspect)> = Vec::new();
     let mut same_looks: Vec<String> = Vec::new();
-    let mut same_looks_total = 0usize;
     let mut equivalent: Vec<String> = Vec::new();
     let mut only_local: Vec<(String, u64, u64)> = Vec::new();
-    let mut counts = Summary::default();
-    let local_owned = local.to_owned();
-    walk(local, local, &ex, 0, &mut |rel, size, modified| {
-        let key = rel.to_ascii_lowercase();
-        let Some(entry) = index.remove(&key) else {
-            counts.only_local += 1;
-            only_local.push((rel.to_owned(), size, modified));
-            return;
-        };
-        if entry.size == size && entry.modified == modified {
-            counts.same += 1;
-            return;
+    let mut only_server: Vec<(String, u64, u64)> = Vec::new();
+    for item in &scan.items {
+        let mine = item.local.as_ref();
+        match item.verdict {
+            Verdict::OnlyLocal => {
+                if let Some(side) = mine {
+                    only_local.push((side.rel.clone(), side.size, side.modified));
+                }
+            }
+            Verdict::OnlyServer => {
+                if let Some(side) = item.server.as_ref() {
+                    only_server.push((side.rel.clone(), side.size, side.modified));
+                }
+            }
+            Verdict::Same => {
+                if let Some(side) = mine {
+                    same_looks.push(side.rel.clone());
+                }
+            }
+            Verdict::Trivial | Verdict::Different => {
+                let (Some(mine), Some(theirs)) = (mine, item.server.as_ref()) else {
+                    continue;
+                };
+                let detail = inspect(&local.join(&mine.rel), &server.join(&theirs.rel));
+                if item.verdict == Verdict::Trivial {
+                    if equivalent.len() < LISTING_MAX {
+                        equivalent.push(match detail {
+                            Inspect::Equivalent(reason) => format!("{}（{reason}）", mine.rel),
+                            _ => mine.rel.clone(),
+                        });
+                    }
+                } else if differing.len() < LISTING_MAX {
+                    differing.push((mine.rel.clone(), mine.size, mine.modified, theirs.size, theirs.modified, detail));
+                }
+            }
+            // 未核对的条目不展开成已确认的诊断。
+            Verdict::Unverified => {}
         }
-        if start.elapsed() > Limits::default().max_time {
-            counts.unverified += 1;
-            return;
-        }
-        let inspect = inspect(&local_owned.join(rel), &server.join(&entry.rel));
-        match inspect {
-            Inspect::Same => {
-                counts.same += 1;
-                same_looks_total += 1;
-                if same_looks.len() < LISTING_MAX {
-                    same_looks.push(rel.to_owned());
-                }
-            }
-            Inspect::Equivalent(reason) => {
-                counts.trivial += 1;
-                if equivalent.len() < LISTING_MAX {
-                    equivalent.push(format!("{rel}（{reason}）"));
-                }
-            }
-            Inspect::Unreadable { side, message } => {
-                counts.differing += 1;
-                if differing.len() < LISTING_MAX {
-                    differing.push((rel.to_owned(), size, modified, entry.size, entry.modified, Inspect::Unreadable { side, message }));
-                }
-            }
-            Inspect::TooBig { first } | Inspect::Binary { first } => {
-                counts.differing += 1;
-                if differing.len() < LISTING_MAX {
-                    differing.push((rel.to_owned(), size, modified, entry.size, entry.modified, match inspect {
-                        Inspect::TooBig { .. } => Inspect::TooBig { first },
-                        _ => Inspect::Binary { first },
-                    }));
-                }
-            }
-            Inspect::Text { first, lines } => {
-                counts.differing += 1;
-                if differing.len() < LISTING_MAX {
-                    differing.push((rel.to_owned(), size, modified, entry.size, entry.modified, Inspect::Text { first, lines }));
-                }
-            }
-        }
-    });
-    counts.only_server = index.len();
-    let mut only_server: Vec<(String, u64, u64)> = index
-        .into_values()
-        .map(|e| (e.rel, e.size, e.modified))
-        .collect();
+    }
     only_server.sort_by(|a, b| a.0.cmp(&b.0));
     only_local.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -702,8 +811,8 @@ pub fn diagnose(local: &Path, server: &Path, filter: &str) -> Result<String, Str
     }
     if !same_looks.is_empty() {
         out.push_str(&format!(
-            "== 大小或修改时间不同、但内容一致（{} 项，列 {}）==\r\n这些文件多半是 Beyond Compare 合并时重写了时间戳，属于正常现象。\r\n",
-            same_looks_total,
+            "== 内容一致（{} 项，列 {}）==\r\n这些文件已逐字节核对，大小和时间戳不参与一致性判定。\r\n",
+            scan.same_by_content,
             same_looks.len()
         ));
         for item in &same_looks {
@@ -773,7 +882,7 @@ fn inspect(a: &Path, b: &Path) -> Inspect {
     if big(a) || big(b) {
         return Inspect::TooBig { first: Some(first) };
     }
-    let (x, y) = match (fs::read(a), fs::read(b)) {
+    let (x, y) = match (read_limited(a, NORMALIZE_MAX), read_limited(b, NORMALIZE_MAX)) {
         (Ok(x), Ok(y)) => (x, y),
         (Err(e), _) => return Inspect::Unreadable { side: "本地端", message: e.to_string() },
         (_, Err(e)) => return Inspect::Unreadable { side: "服务器端", message: e.to_string() },
@@ -781,7 +890,7 @@ fn inspect(a: &Path, b: &Path) -> Inspect {
     if !looks_text(&x) || !looks_text(&y) {
         return Inspect::Binary { first: Some(first) };
     }
-    if normalize(&x) == normalize(&y) {
+    if normalized_lines(&x).eq(normalized_lines(&y)) {
         return Inspect::Equivalent(trivial_reason(&x, &y));
     }
     Inspect::Text { first, lines: differing_lines(&x, &y) }
@@ -993,6 +1102,16 @@ mod tests {
         assert_eq!(s.differing, 1, "同大小同时间戳但内容不同的那项要按内容算成差异");
         assert_eq!(s.same, 1, "只是时间戳不同的那项不算差异");
         assert_eq!(s.samples, vec!["edited.txt".to_owned()]);
+    }
+
+    #[test]
+    fn identical_size_and_timestamp_do_not_hide_a_content_change() {
+        let (local, server) = tree("same_metadata_content");
+        put(&local, "edited.txt", b"hello", 1_700_000_500);
+        put(&server, "edited.txt", b"hellp", 1_700_000_500);
+        let counts = compare(&local, &server, "").unwrap();
+        assert_eq!(counts.differing, 1);
+        assert_eq!(counts.same, 0);
     }
 
     #[test]

@@ -39,6 +39,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-log-plugin"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1274,6 +1282,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "merge-plugin"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "encoding_rs",
+ "regex",
+ "roxmltree 0.21.1",
+ "serde",
+ "serde_json",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1963,6 +1984,7 @@ dependencies = [
  "egui",
  "encoding_rs",
  "image",
+ "libloading",
  "raw-window-handle",
  "regex",
  "resvg",

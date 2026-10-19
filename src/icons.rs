@@ -15,6 +15,8 @@ const PX: usize = 64;
 #[derive(Clone)]
 pub struct IconSet {
     pub settings: TextureHandle,
+    /// 插件面板入口（拼图块）
+    pub plugins: TextureHandle,
     /// 主题键的三态图源：随当前主题设置切换（跟随系统 / 浅色 / 深色）
     pub theme_system: TextureHandle,
     pub theme_light: TextureHandle,
@@ -33,6 +35,7 @@ impl IconSet {
     pub fn load(ctx: &egui::Context) -> Self {
         Self {
             settings: texture(ctx, "icon-settings", include_str!("../assets/icons/settings.svg")),
+            plugins: texture(ctx, "icon-plugins", include_str!("../assets/icons/plugins.svg")),
             theme_system: texture(
                 ctx,
                 "icon-theme-system",
@@ -127,6 +130,7 @@ mod tests {
     fn embedded_svgs_rasterize_to_visible_icons() {
         for (name, svg) in [
             ("settings", include_str!("../assets/icons/settings.svg")),
+            ("plugins", include_str!("../assets/icons/plugins.svg")),
             ("theme_system", include_str!("../assets/icons/theme_system.svg")),
             ("theme_light", include_str!("../assets/icons/theme_light.svg")),
             ("theme_dark", include_str!("../assets/icons/theme_dark.svg")),

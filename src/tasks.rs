@@ -1,7 +1,7 @@
 //! 每个 svn 动作的发起点：起后台任务（检测 / 更新 / 提交 / 日志 / 维护 / relocate）、
 //! 目录的增删移，以及各页面之间的跳转。
 
-use crate::{Level, Maintain, Page, Relocate, Resolve, ResolveRow, Rollback, RepoApp};
+use crate::{Level, Maintain, MergePreview, Page, Relocate, Resolve, ResolveRow, Rollback, RepoApp};
 use crate::{daterange, svn, update};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -352,6 +352,185 @@ impl RepoApp {
                 sink.line(format!("→ {message}"));
                 Data::Run { dir: index, ok, message, reload: false }
             });
+    }
+
+    /// 打开双向合并窗口并起后台预览。备份清单在这里扫一次：上一次合并崩在半路时，
+    /// 窗口顶部得立刻说得出「先恢复」，这次的清单才是叠在完整状态上算的
+    pub fn open_merge(&mut self, index: usize) {
+        // 入口在「更多」里已被收起，这里再挡一层，防止旧快捷键 / 测试路径绕过
+        if !self.plugin_installed(crate::plugins::PluginId::Merge) {
+            self.hint("「双向合并」插件没装：点顶栏的拼图按钮，在「插件」面板里导入 merge-plugin.dll");
+            return;
+        }
+        let backups = crate::merge::backups(&crate::config::config_dir());
+        // 双向合并看的是整份清单，默认就铺满工作区；点「还原大小」回默认尺寸
+        self.merge = Some(MergePreview {
+            dir: index,
+            backups,
+            zoom: crate::history::Zoom::maximized(),
+            ..Default::default()
+        });
+        self.spawn_merge_plan(index);
+    }
+
+    /// 「更多 → 双向合并」的预览：读两边内容、往回扫历史定岔，算出每个文件的处置。
+    /// 一个字节都不写，算完的清单交给合并窗口过目，落盘是 `spawn_merge_apply` 的事。
+    pub fn spawn_merge_plan(&mut self, index: usize) {
+        if self.dir_kind(index) == RepoKind::Git {
+            self.hint("双向合并只针对 SVN 绑定的目录，Git 目录请用分支合并");
+            return;
+        }
+        let (Some(svn), Some(server), Some(local)) =
+            (self.svn_or_none(), self.dir_path(index), self.bound_local(index))
+        else {
+            return;
+        };
+        let label = self.dir_label(index);
+        if self.pool.has(Kind::Merge, index) {
+            self.hint("上一次合并预览还在跑，请待其结束后再试");
+            return;
+        }
+        if self.pool.is_writing(index) {
+            // 更新 / 提交 / 解决冲突跑着的时候，工作副本树半新半旧，定出来的岔是假的
+            self.hint("该目录还有写操作在跑，等这一趟结束再算合并");
+            return;
+        }
+        let filter = self.cfg.dirs[index].bc_filter.clone();
+        let include = self.cfg.dirs[index].merge_include.clone();
+        let exclude = self.cfg.dirs[index].merge_exclude.clone();
+        let lcs_cell_limit = {
+            let n = self.cfg.dirs[index].lcs_cell_limit;
+            if n == 0 { crate::merge::LCS_CELL_LIMIT } else { n }
+        };
+        self.pool.spawn(Kind::Merge, index, format!("{label} 合并预览"), move |sink| {
+            sink.line(format!(
+                "$ 合并预览：本地开发侧 {} ↔ 服务器端 {}",
+                local.display(),
+                server.display()
+            ));
+            // 状态表读不出来的话，「这个文件是不是正冲突 / 已计划删除」就无从判断，
+            // 整轮直接失败比逐条报「无基线」诚实；这件事现在由插件自己判断（它自己调 svn）
+            let state_path = crate::merge::sync_state_path(&crate::config::config_dir(), &local, &server);
+            match crate::merge::plan_with_state(
+                &local,
+                &server,
+                &filter,
+                &include,
+                &exclude,
+                Some(&svn),
+                &crate::merge::MergeLimits {
+                    lcs_cell_limit,
+                    ..Default::default()
+                },
+                Some(&state_path),
+            ) {
+                Ok(plan) => {
+                    if plan.binding_reset {
+                        sink.line("→ SVN 仓库/分支或基线身份发生变化，已停用旧同步基线，需重新核对");
+                    }
+                    sink.line(format!(
+                        "→ 合并预览：写入 {} 项 · 跳过 {} 项（冲突 {} · 待人工 {} · 不在范围 {}）",
+                        plan.writing(),
+                        plan.skipping(),
+                        plan.conflicts(),
+                        plan.undecided(),
+                        plan.out_of_scope()
+                    ));
+                    if plan.budget_hit {
+                        sink.line(format!("→ 预算用满，还有 {} 项没核对：这份清单不是全部", plan.untried));
+                    }
+                    Data::MergePlan { dir: index, ok: true, plan: Some(Box::new(plan)) }
+                }
+                Err(message) => {
+                    sink.line(format!("→ 合并预览失败：{message}"));
+                    Data::MergePlan { dir: index, ok: false, plan: None }
+                }
+            }
+        });
+    }
+
+    /// 按预览清单落盘：`backup` 为真时两边整份备份到配置目录后再写，为假就是用户自己核对过的
+    /// 「直接合并」，不留还原点。收尾补一次检测，让「本地端差异」和「待提交 N 项」跟着合并结果一起变
+    pub fn spawn_merge_apply(&mut self, index: usize, plan: Box<crate::merge::Plan>, backup: bool) {
+        let label = self.dir_label(index);
+        if self.pool.is_writing(index) {
+            self.hint("该目录还有写操作在跑，等它结束再落盘");
+            return;
+        }
+        let root = crate::config::config_dir();
+        self.pool
+            .spawn(Kind::ApplyMerge, index, format!("{label} 应用合并"), move |sink| {
+                sink.line(if backup {
+                    format!("$ 备份到 {} 并按清单写入", root.display())
+                } else {
+                    "$ 按清单写入（不备份，本次不留还原点）".to_owned()
+                });
+                let result = crate::merge::apply(&plan, &root, backup).map(|done| {
+                    (done.written, done.bytes, done.failed, done.backup.map(|d| d.display().to_string()))
+                });
+                merge_write_result(index, &label, "写入", result, &sink)
+            });
+    }
+
+    /// 拿某一次备份还原：把合并写出去的内容整份退回备份时的样子
+    pub fn spawn_merge_restore(&mut self, index: usize, backup: PathBuf) {
+        let label = self.dir_label(index);
+        if self.pool.is_writing(index) {
+            self.hint("该目录还有写操作在跑，等它结束再还原");
+            return;
+        }
+        let svn = self.svn_or_none();
+        self.pool
+            .spawn(Kind::ApplyMerge, index, format!("{label} 撤销合并"), move |sink| {
+                sink.line(format!("$ 从 {} 还原", backup.display()));
+                let result = crate::merge::restore_with_client(&backup, svn.as_ref())
+                    .map(|done| {
+                        (
+                            done.restored + done.removed,
+                            0_u64,
+                            done.failed,
+                            Some(backup.display().to_string()),
+                        )
+                    });
+                merge_write_result(index, &label, "还原", result, &sink)
+            });
+    }
+
+    /// 清掉配置目录里历次合并留下的备份。删的全是这台机器上的副本，两边文件一个字节不动，
+    /// 但删完就没有还原点，所以确认在界面上走过一遍才到这里。备份攒起来可能几十兆，走后台。
+    pub fn spawn_merge_clean(&mut self, index: usize) {
+        let label = self.dir_label(index);
+        let root = crate::config::config_dir();
+        self.pool
+            .spawn(Kind::CleanBackup, index, format!("{label} 清理备份"), move |sink| {
+                sink.line(format!("$ 删除 {} 下的合并备份", root.display()));
+                let (removed, bytes) = crate::merge::clean_backups(&root);
+                let left = crate::merge::backups(&root)
+                    .into_iter()
+                    .filter(|item| !item.unfinished)
+                    .count();
+                let message = if left == 0 {
+                    format!(
+                        "{label}：已清掉 {removed} 次备份，释放 {}",
+                        crate::merge::human_bytes(bytes)
+                    )
+                } else {
+                    format!("{label}：还有 {left} 次备份没删掉，多半是目录正被别的程序占用")
+                };
+                sink.line(format!("→ {message}"));
+                Data::Run { dir: index, ok: left == 0, message, reload: false }
+            });
+    }
+
+    /// 「更多 → 绑定对比对象」里绑的那一侧（本地开发侧）。没绑就没有「本地端」可谈
+    fn bound_local(&self, index: usize) -> Option<PathBuf> {
+        let target = self
+            .cfg
+            .dirs
+            .get(index)
+            .map(|d| d.bc_target.trim_matches('"').trim_matches(['/', '\\']).to_owned())
+            .unwrap_or_default();
+        (!target.is_empty()).then(|| PathBuf::from(target))
     }
 
     /// `quiet` 为真时不在输出区打印执行日志（提交成功后的自动刷新用：那是程序
@@ -1827,4 +2006,39 @@ impl RepoApp {
     pub fn back_to_main(&mut self) {
         self.page = Page::Main;
     }
+}
+
+/// 合并落盘与还原共用的收尾消息。后台闭包拿不到 `self`，所以是模块级函数而不是方法：
+/// 项数与备份位置说明「动了什么」，没处理成功的那几项单独点名，零项时给正面说法
+fn merge_write_result(
+    index: usize,
+    label: &str,
+    verb: &str,
+    result: Result<(usize, u64, Vec<String>, Option<String>), String>,
+    sink: &crate::jobs::Sink,
+) -> Data {
+    let (message, ok) = match result {
+        Ok((count, bytes, failed, backup)) => {
+            if count == 0 && failed.is_empty() {
+                (format!("{label}：两边已经一致，{verb} 0 项"), true)
+            } else {
+                let size =
+                    if bytes > 0 { format!("，共 {}", crate::merge::human_bytes(bytes)) } else { String::new() };
+                // 直接合并那趟没有还原点，尾巴得说明白，别让人以为还能一键退回
+                let where_back = match backup {
+                    Some(dir) => format!("，备份在 {dir}"),
+                    None => "，本次未备份".to_owned(),
+                };
+                let mut text = format!("{label}：已{verb} {count} 项{size}{where_back}");
+                if !failed.is_empty() {
+                    text.push_str(&format!("；{} 项没成功：{}", failed.len(), failed.join("；")));
+                }
+                (text, failed.is_empty())
+            }
+        }
+        Err(reason) => (format!("{label}：没有落盘——{reason}"), false),
+    };
+    sink.line(format!("→ {message}"));
+    // 没落盘时不补检测：树没变，重跑一遍只是白等
+    Data::Run { dir: index, ok, message, reload: ok }
 }

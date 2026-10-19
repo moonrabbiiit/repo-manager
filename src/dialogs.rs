@@ -33,6 +33,54 @@ fn checked_row(ui: &mut egui::Ui, id: egui::Id, checked: bool, add_contents: imp
     ui.interact(row.response.rect, id, egui::Sense::hover());
 }
 
+/// 规则窗口四格共用的定尺寸富文本格。egui 的 `TextEdit` 只认 `min_size.x`，纵向一律按内容撑开，
+/// 两格写多写少就一高一矮、排在下面的「确认」还跟着被顶跑。这里把尺寸钉死：外层 `Frame` 画边框，
+/// 固定视口的 `ScrollArea` 兜住高宽，里面放一个无边框 `TextEdit`，内容写满就地滚动，
+/// 整窗几何不再随字数变。
+fn rules_field(
+    ui: &mut egui::Ui,
+    salt: &'static str,
+    buf: &mut String,
+    hint: &'static str,
+    size: Vec2,
+) -> egui::Response {
+    let margin = field_margin(ui);
+    let inner = egui::vec2(
+        size.x - 2.0 * margin.left as f32,
+        size.y - 2.0 * margin.top as f32,
+    );
+    // 边框描哪一档取决于这一格有没有焦点，所以 id 得先算出来才问得到
+    let id = ui.make_persistent_id(salt);
+    let stroke = if ui.memory(|mem| mem.has_focus(id)) {
+        ui.visuals().selection.stroke
+    } else {
+        ui.visuals().widgets.inactive.bg_stroke
+    };
+    Frame::new()
+        .fill(ui.visuals().text_edit_bg_color())
+        .stroke(stroke)
+        .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+        .inner_margin(margin)
+        .show(ui, |ui| {
+            ScrollArea::vertical()
+                .id_salt(salt)
+                .auto_shrink([false, false])
+                .max_width(inner.x)
+                .max_height(inner.y)
+                .show(ui, |ui| {
+                    ui.add(
+                        TextEdit::multiline(buf)
+                            .id(id)
+                            .hint_text(hint)
+                            .min_size(egui::vec2(inner.x, 0.0))
+                            .frame(Frame::new()),
+                    )
+                })
+                .inner
+        })
+        .inner
+}
+
 /// 「解决冲突」窗口里那条策略下拉：四个选项排下来和 `svn resolve --accept` 的取值一一对应，
 /// 选中项的短名当按钮文字。每个选项挂一句后果说明——「用我的版本」和「用服务器版本」
 /// 各会丢掉一边，不写出来最容易点错。
@@ -925,6 +973,636 @@ impl RepoApp {
         }
     }
 
+    // ------------------------------------------------------------ 「双向合并」预览窗口
+
+    /// 本地开发侧 ↔ 服务器端的双向合并预览。清单里只有「写入」那几行动文件，落盘前两侧都会先整份备份。
+    /// `Plan` 里带着每份文件算好的字节，逐帧 clone 等于把它们复制一遍，所以这扇窗 take 出来用完再放回去。
+    pub(crate) fn merge_dialog(&mut self, ctx: &egui::Context) {
+        use crate::merge::Action;
+        // 插件被卸载后这扇窗不再出现（卸载时会清掉，这里再兜一层）
+        if !self.plugin_installed(crate::plugins::PluginId::Merge) {
+            self.merge = None;
+            return;
+        }
+        let Some(mut dialog) = self.merge.take() else { return };
+        let dir = dialog.dir;
+        // 窗口开着时目录可能已被移除：这扇窗没有归属，不收回来
+        if self.cfg.dirs.get(dir).is_none() {
+            return;
+        }
+        let label = self.dir_label(dir);
+        let scanning = self.pool.has(Kind::Merge, dir);
+        let running = self.pool.has(Kind::ApplyMerge, dir);
+        let cleaning = self.pool.has(Kind::CleanBackup, dir);
+        let backup_root = crate::config::config_dir();
+        // 上一次合并停在半路：备份还留着，两侧却已不一致，先还原再开始新的写入
+        let interrupted = dialog
+            .backups
+            .iter()
+            .find(|item| item.unfinished)
+            .map(|item| (item.name.clone(), item.dir.clone()));
+        let plan = dialog.plan.take();
+        let id = egui::Id::new("merge");
+        // Esc：最大化时先还原，再按一次才关窗，和两个明细窗口同一个规矩
+        let close = dialog.zoom.escape(ctx, id);
+        let mut open = true;
+        let window = egui::Window::new(format!("双向合并 · {label}"))
+            .id(id)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true);
+        // 默认矩形摆正即可，最大化与还原那一帧的矩形由 Zoom 记账；清单吃满窗口剩下的地方，
+        // 所以窗口多大都不会在底下留出一片空白
+        let normal_rect = crate::ui::centered_rect(ctx, Vec2::new(620.0, 520.0));
+        let shown = dialog
+            .zoom
+            .place(ctx, window, normal_rect)
+            .show(ctx, |ui| {
+                if !dialog.error.is_empty() {
+                    ui.label(
+                        RichText::new(dialog.error.clone())
+                            .size(12.0)
+                            .color(ink(ui, crate::ERR)),
+                    );
+                }
+                let Some(preview) = plan.as_ref() else {
+                    if scanning {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("正在读取两侧内容并推导基线 …")
+                                    .weak()
+                                    .size(11.5),
+                            );
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new("尚无清单，可从目录行「更多 → 双向合并」重新预览。")
+                                .size(12.0),
+                        );
+                    }
+                    return;
+                };
+                let rows: Vec<&crate::merge::Entry> = preview
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.action != Action::SkipUnchanged)
+                    .collect();
+                // 两条写入路径共用同一套前置条件，卡住的原因原样写进悬停里
+                let blocked = if running {
+                    Some("上一次写入还在跑")
+                } else if interrupted.is_some() {
+                    Some("上一次合并尚未还原，先处理完那一次")
+                } else if preview.writing() == 0 {
+                    Some("清单里没有要写入的条目")
+                } else {
+                    None
+                };
+                let can_write = blocked.is_none();
+
+                // 左上：功能按钮一行排开（应用并备份 / 直接合并 / 导出报告 / 历次备份 / 最大化）
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            can_write,
+                            egui::Button::new(RichText::new("应用并备份").strong()),
+                        )
+                        .on_hover_text(blocked.unwrap_or(
+                            "先整份备份两侧，再按清单写入；这一次之后能一键还原",
+                        ))
+                        .clicked()
+                    {
+                        dialog.confirm = true;
+                        self.hint(
+                            "写入会同时改动本地开发侧与工作副本，两侧原内容先整份备份；核对清单后再次点击「确认写入」",
+                        );
+                    }
+                    // 这条路把确认写在字面上：一次点击就落盘，不留还原点
+                    if ui
+                        .add_enabled(can_write, egui::Button::new("我已确认无误，直接合并"))
+                        .on_hover_text(blocked.unwrap_or("不备份、不留还原点，按清单一次写完"))
+                        .clicked()
+                    {
+                        self.spawn_merge_apply(dir, Box::new(preview.clone()), false);
+                    }
+                    if ui
+                        .button("导出合并报告")
+                        .on_hover_text("把本清单存成文字文件，含每项处置与未核对条数")
+                        .clicked()
+                    {
+                        let now = chrono::Local::now();
+                        let text = format!(
+                            "生成时间：{}\n目录：{label}\n\n{}",
+                            now.format("%Y-%m-%d %H:%M:%S"),
+                            crate::merge::report(preview)
+                        );
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("保存双向合并预览清单")
+                            .set_file_name(format!(
+                                "合并预览_{}.txt",
+                                now.format("%Y%m%d_%H%M%S")
+                            ))
+                            .save_file()
+                        {
+                            match std::fs::write(&path, text) {
+                                Ok(()) => self.push(
+                                    Level::Info,
+                                    format!("合并预览清单已写入：{}", path.display()),
+                                ),
+                                Err(e) => {
+                                    self.push(Level::Error, format!("清单写入失败：{e}"))
+                                }
+                            }
+                        }
+                    }
+                    let toggle = if dialog.show_backups { "收起备份记录" } else { "历次备份" };
+                    if ui.button(toggle).clicked() {
+                        dialog.show_backups = !dialog.show_backups;
+                    }
+                    if ui
+                        .button(if dialog.zoom.maximized { "还原大小" } else { "最大化" })
+                        .on_hover_text(if dialog.zoom.maximized {
+                            "把窗口缩回最大化之前的大小（按 Esc 同样先还原）"
+                        } else {
+                            "把窗口铺满整个工作区，清单能多看几十行"
+                        })
+                        .clicked()
+                    {
+                        dialog.zoom.toggle();
+                    }
+                    if running {
+                        ui.spinner();
+                        ui.label(RichText::new("正在写入 …").weak().size(11.5));
+                    }
+                });
+                // 确认写入那一栏：第一下只把按钮换成确认，再点一次才真的动两边
+                if dialog.confirm {
+                    ui.horizontal(|ui| {
+                        let button = egui::Button::new(
+                            RichText::new(format!("确认写入 {} 项", preview.writing()))
+                                .strong()
+                                .color(crate::DANGER_TEXT),
+                        )
+                        .fill(crate::DANGER_FILL);
+                        if ui.add_enabled(can_write, button).clicked() {
+                            dialog.confirm = false;
+                            self.spawn_merge_apply(dir, Box::new(preview.clone()), true);
+                        }
+                        if ui.button("先不写入").clicked() {
+                            dialog.confirm = false;
+                        }
+                    });
+                }
+                // 上一次合并中断未完成：先还原，再开始新的写入
+                if let Some((name, path)) = interrupted.as_ref() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "上一次合并（{name}）中断未完成，两侧内容不一致：先还原，再开始新的写入。"
+                            ))
+                            .size(11.5)
+                            .color(ink(ui, crate::AMBER)),
+                        );
+                        if ui
+                            .add_enabled(
+                                !running,
+                                egui::Button::new(RichText::new("还原上一次").strong()),
+                            )
+                            .clicked()
+                        {
+                            self.spawn_merge_restore(dir, path.clone());
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "单方改动的区域合入对面，两侧收敛为同一份内容；同一处两边都改过的文件保持原样，仅列入本清单。",
+                    )
+                    .weak()
+                    .size(11.5),
+                );
+                ui.add_space(6.0);
+                // 主体两栏：左侧卡片装文件清单，右侧面板是处理结果的汇总表
+                // 非最大化时按固定设计宽（620）切分，不读 available_width —— 否则窗口首帧
+                // 用过大的可用宽算出过大的左右栏、又把窗口顶大，下一帧更大，循环涨到满屏。
+                // 最大化时窗口已被 Zoom 拉到工作区尺寸，available_width 才是真满宽，照用即可。
+                let body_h = ui.available_height().max(120.0);
+                let total_w = if dialog.zoom.maximized {
+                    ui.available_width()
+                } else {
+                    normal_rect.width()
+                };
+                // 两栏都按固定百分比切：左文件清单占大头、右处理结果只占一小部分。
+                // 这样无论内容多少，右栏永远有自己那一份宽度、不会被挤没（之前就吃过这个亏）。
+                let left_w = total_w * 0.74;
+                let right_w = total_w * 0.26 - ui.spacing().item_spacing.x;
+                ui.horizontal(|ui| {
+                    // 左：文件清单卡片
+                    // 这枚子 ui 必须显式改成 top_down：它挂在 ui.horizontal 之下，不指定就会
+                    // 继承横向布局，把卡片里的标题 / 清单行全挤成一行横排，卡片最小宽被撑到满屏。
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_w, body_h),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                        egui::Frame::new()
+                            .fill(crate::ui::pane_fill(ui))
+                            .stroke(egui::Stroke::new(1.0, crate::ui::pane_stroke(ui)))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!("文件清单（{}）", rows.len()))
+                                        .size(12.5)
+                                        .strong(),
+                                );
+                                ui.add_space(4.0);
+                                ScrollArea::vertical()
+                                    .id_salt("merge_rows")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if rows.is_empty() {
+                                            ui.label(
+                                                RichText::new("两侧内容已经一致，无需写入。")
+                                                    .size(12.5)
+                                                    .strong(),
+                                            );
+                                        }
+                                        // 处置标记的胶囊统一按「最长标签」的宽度画，所有文件名才会落在同一条竖线上
+                                        let marker_w = rows
+                                            .iter()
+                                            .map(|e| {
+                                                ui.painter()
+                                                    .layout_no_wrap(
+                                                        e.action_text(),
+                                                        egui::FontId::proportional(11.5),
+                                                        egui::Color32::WHITE,
+                                                    )
+                                                    .size()
+                                                    .x
+                                            })
+                                            .fold(0.0, f32::max)
+                                            + 14.0;
+                                        for entry in rows.iter() {
+                                            let write = entry.action.is_write();
+                                            let conflict = entry.action == Action::SkipConflict;
+                                            let local = preview.local_root.join(&entry.local_rel);
+                                            let server = preview.server_root.join(&entry.server_rel);
+                                            let regions = entry.regions_text();
+                                            let ancestor = entry.ancestor.label();
+                                            let note = entry.note.clone();
+                                            let display = entry.display.clone();
+                                            ui.horizontal(|ui| {
+                                                // 处置标记走主页简约卡片同款胶囊：固定 104px 宽、左对齐，
+                                                // 让所有文件名起点在一条竖线上；绿=会写、红=冲突、琥珀=跳过/待人工
+                                                let disp_color = if conflict
+                                                    || matches!(entry.action, Action::DeleteLocal | Action::DeleteServer)
+                                                {
+                                                    crate::ERR
+                                                } else if write {
+                                                    crate::OK
+                                                } else {
+                                                    crate::AMBER
+                                                };
+                                                let (fill, text_color) =
+                                                    crate::home::pill_colors(ui, disp_color, true);
+                                                let (_id, rect) =
+                                                    ui.allocate_space(egui::vec2(marker_w, 20.0));
+                                                ui.painter().rect_filled(rect, 10.0, fill);
+                                                let galley = ui.painter().layout_no_wrap(
+                                                    entry.action_text(),
+                                                    egui::FontId::proportional(11.5),
+                                                    text_color,
+                                                );
+                                                ui.painter().galley(
+                                                    rect.center() - galley.size() / 2.0,
+                                                    galley,
+                                                    text_color,
+                                                );
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new(display)
+                                                                .monospace()
+                                                                .size(12.0),
+                                                        )
+                                                        .on_hover_text(format!(
+                                                            "本地：{}\n服务器：{}",
+                                                            local.display(),
+                                                            server.display()
+                                                        ));
+                                                        if !regions.is_empty() {
+                                                            ui.label(
+                                                                RichText::new(regions)
+                                                                    .size(11.0)
+                                                                    .weak(),
+                                                            );
+                                                        }
+                                                        if write && ancestor != "—" {
+                                                            ui.label(
+                                                                RichText::new(ancestor)
+                                                                    .size(11.0)
+                                                                    .weak(),
+                                                            );
+                                                        }
+                                                    });
+                                                    if !write && !note.is_empty() {
+                                                        ui.label(
+                                                            RichText::new(note).size(11.0).weak(),
+                                                        );
+                                                    }
+                                                });
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        if conflict
+                                                            && ui
+                                                                .button("手工处理")
+                                                                .on_hover_text(
+                                                                    "用 Beyond Compare 打开两侧文件对照",
+                                                                )
+                                                                .clicked()
+                                                        {
+                                                            let (left, right) =
+                                                                crate::bcompare::order_sides(
+                                                                    &server,
+                                                                    &local,
+                                                                    &self.cfg.bc_server_side,
+                                                                );
+                                                            self.open_bcompare(&[left, right], &[]);
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                            ui.add_space(2.0);
+                                        }
+                                    });
+                            });
+                    });
+                    // 右：处理结果汇总表
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(right_w, body_h),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                        egui::Frame::new()
+                            .fill(crate::ui::pane_fill(ui))
+                            .stroke(egui::Stroke::new(1.0, crate::ui::pane_stroke(ui)))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("处理结果").size(12.5).strong());
+                                ui.add_space(4.0);
+                                ScrollArea::vertical()
+                                    .id_salt("merge_summary")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "写入",
+                                            format!("{} 项", preview.writing()),
+                                            crate::OK,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "行级合并",
+                                            preview.line_merges().to_string(),
+                                            crate::OK,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "整文件覆盖",
+                                            preview.overwrites().to_string(),
+                                            crate::OK,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "新增拷入",
+                                            preview.copies().to_string(),
+                                            crate::OK,
+                                        );
+                                        if preview.deletes() > 0 {
+                                            Self::merge_summary_row(
+                                                ui,
+                                                "同步删除",
+                                                format!("{} 项", preview.deletes()),
+                                                crate::ERR,
+                                            );
+                                        }
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "跳过",
+                                            format!("{} 项", preview.skipping()),
+                                            crate::AMBER,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "冲突",
+                                            preview.conflicts().to_string(),
+                                            crate::ERR,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "待人工",
+                                            preview.undecided().to_string(),
+                                            crate::AMBER,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "两边都改",
+                                            preview.binaries().to_string(),
+                                            crate::AMBER,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "不在范围",
+                                            preview.out_of_scope().to_string(),
+                                            crate::AMBER,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "已一致",
+                                            preview.agreed().to_string(),
+                                            crate::OK,
+                                        );
+                                        Self::merge_summary_row(
+                                            ui,
+                                            "已核对",
+                                            format!("{} 项", preview.checked),
+                                            crate::OK,
+                                        );
+                                        if preview.unverified > 0 {
+                                            Self::merge_summary_row(
+                                                ui,
+                                                "未核对内容",
+                                                format!("{} 项", preview.unverified),
+                                                crate::AMBER,
+                                            );
+                                        }
+                                        if preview.budget_hit {
+                                            Self::merge_summary_row(
+                                                ui,
+                                                "预算用满",
+                                                format!("{} 项", preview.untried),
+                                                crate::AMBER,
+                                            );
+                                        }
+                                        ui.add_space(6.0);
+                                        // 备份：展开 / 收起 + 清理
+                                        let toggle = if dialog.show_backups {
+                                            "收起备份记录"
+                                        } else {
+                                            "历次备份"
+                                        };
+                                        if ui.button(toggle).clicked() {
+                                            dialog.show_backups = !dialog.show_backups;
+                                        }
+                                        if dialog.show_backups && dialog.backups.is_empty() {
+                                            ui.label(
+                                                RichText::new("还没有过一次合并写入，备份目录为空")
+                                                    .size(11.0)
+                                                    .weak(),
+                                            );
+                                        }
+                                        if dialog.show_backups {
+                                            for backup in dialog.backups.clone() {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        RichText::new(backup.name)
+                                                            .monospace()
+                                                            .size(11.5),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} 项 · {}",
+                                                            backup.files,
+                                                            crate::merge::human_bytes(backup.bytes)
+                                                        ))
+                                                        .size(11.0)
+                                                        .weak(),
+                                                    );
+                                                    if backup.unfinished {
+                                                        ui.label(
+                                                            RichText::new("未完成")
+                                                                .size(11.0)
+                                                                .color(ink(ui, crate::AMBER)),
+                                                        );
+                                                    }
+                                                    if ui
+                                                        .add_enabled(
+                                                            !running,
+                                                            egui::Button::new("还原到这次"),
+                                                        )
+                                                        .on_hover_text(format!(
+                                                            "还原：{}",
+                                                            backup.dir.display()
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        self.spawn_merge_restore(
+                                                            dir,
+                                                            backup.dir.clone(),
+                                                        );
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        let stored = dialog
+                                            .backups
+                                            .iter()
+                                            .filter(|item| !item.unfinished)
+                                            .count();
+                                        if ui
+                                            .add_enabled(
+                                                !running && !cleaning && stored > 0,
+                                                egui::Button::new("清理备份"),
+                                            )
+                                            .on_hover_text(if stored == 0 {
+                                                "备份目录里还没有已完成的备份"
+                                            } else {
+                                                "删掉已完成的历次备份；写到一半断掉的那次留着"
+                                            })
+                                            .clicked()
+                                        {
+                                            dialog.wipe = true;
+                                            self.hint(
+                                                "清理删的是这台机器上的备份副本，两边文件不动；删过之后那几次合并就退不回去了",
+                                            );
+                                        }
+                                        if dialog.wipe {
+                                            let finished: Vec<u64> = dialog
+                                                .backups
+                                                .iter()
+                                                .filter(|item| !item.unfinished)
+                                                .map(|item| item.bytes)
+                                                .collect();
+                                            let bytes: u64 = finished.iter().sum();
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "删掉这 {} 次备份（约 {}）？",
+                                                        finished.len(),
+                                                        crate::merge::human_bytes(bytes)
+                                                    ))
+                                                    .size(11.5),
+                                                );
+                                                let yes = egui::Button::new(
+                                                    RichText::new("确认清理")
+                                                        .strong()
+                                                        .color(crate::DANGER_TEXT),
+                                                )
+                                                .fill(crate::DANGER_FILL);
+                                                if ui.add_enabled(!cleaning, yes).clicked() {
+                                                    dialog.wipe = false;
+                                                    self.spawn_merge_clean(dir);
+                                                }
+                                                if ui.button("先不清理").clicked() {
+                                                    dialog.wipe = false;
+                                                }
+                                            });
+                                            ui.label(
+                                                RichText::new(backup_root.display().to_string())
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .weak(),
+                                            );
+                                        }
+                                    });
+                            });
+                    });
+                });
+            });
+        if let Some(shown) = &shown {
+            dialog.zoom.shown(shown.response.rect);
+        }
+        dialog.plan = plan;
+        // 点标题栏的 × 时 egui 只把 open 写成 false，这一帧窗口还在淡出、show 照旧返回 Some；
+        // open 是每帧新建的局部变量，不在这里丢掉内容，下一帧它又变回 true、窗口重新冒出来
+        self.merge = if shown.is_none() || close || !open {
+            None
+        } else {
+            Some(dialog)
+        };
+    }
+
+    /// 汇总表里的一行：左胶囊标签、右数值，数值按处置语义上色（绿=会写/一致，琥珀=跳过/待人工，红=冲突）。
+    /// 胶囊用主页简约卡片同款的配色（浅色粉彩底深字、深色半透明底原色字）。
+    fn merge_summary_row(ui: &mut egui::Ui, label: &str, value: String, color: egui::Color32) {
+        ui.horizontal(|ui| {
+            let (fill, text_color) = crate::home::pill_colors(ui, color, true);
+            egui::Frame::new()
+                .fill(fill)
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(7, 3))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(label).size(11.5).color(text_color));
+                });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(value).size(12.0).strong().color(ink(ui, color)));
+            });
+        });
+        ui.add_space(2.0);
+    }
+
     // ------------------------------------------------------------ 「全部上传」窗口
 
     /// 所有目录用同一条说明各起一个提交任务。会改动服务器，所以第一下只亮出确认按钮。
@@ -1451,10 +2129,13 @@ impl RepoApp {
 
     // ---------------------------------------------------- 「差异过滤与提交屏蔽」窗口
 
-    /// 目录行「更多 → 差异过滤与提交屏蔽」开的那扇窗，装的是本目录的两套规则：
-    /// 上面一格是「本地差异比对」的过滤条件（`bc_filter`，这里是唯一编辑入口），
-    /// 下面一格是「屏蔽可提交项」（`commit_excludes`，决定哪些改动不进本次提交）。
-    /// 两格都落盘、长期生效；各管各的口径，互不牵连。边写边存，「确认」关窗并按新规则重读本目录。
+    /// 这扇窗与里面四格输入框都是固定尺寸：窗口不许拖大拖小，输入框也不跟着变形。四格分作两页
+    /// 标签，每页两格，切页不动窗口大小。
+    /// 目录行「更多 → 差异过滤与提交屏蔽」开的那扇窗：第一页是「本地差异比对」的过滤条件
+    /// （`bc_filter`，这里是唯一编辑入口）与「屏蔽可提交项」（`commit_excludes`，决定哪些改动
+    /// 不进本次提交），第二页是「参与合并的文件」白名单与「不参与合并的文件」黑名单
+    /// （`merge_include` 与 `merge_exclude`，只在双向合并时放行与收回范围，既不改差异数也不管提交）。
+    /// 四格都落盘、长期生效；各管各的口径，互不牵连。边写边存，「确认」关窗并按新规则重读本目录。
     pub(crate) fn commit_rules_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.commit_rules.clone() else {
             return;
@@ -1466,6 +2147,11 @@ impl RepoApp {
             return;
         }
         let label = self.dir_label(dir);
+        // 双向合并插件卸载后，第二页（合并范围）就没有意义：不露那个标签，也把页码拉回第一页
+        let merge_on = self.plugin_installed(crate::plugins::PluginId::Merge);
+        if !merge_on {
+            dialog.page = 0;
+        }
         // 命中数按最近一次读取的完整清单现算（被挡掉的那些也在里面）：这扇窗从主页「更多」
         // 就能开，那时没有提交页的掩码可读，而 changes 早滤干净了、数出来永远是 0
         let excludes = self.cfg.dirs[dir].commit_excludes.clone();
@@ -1482,90 +2168,164 @@ impl RepoApp {
             None => "上次比对：尚未比对".to_owned(),
         };
         let excludes_before = self.cfg.dirs[dir].commit_excludes.clone();
+        let merge_before = self.cfg.dirs[dir].merge_include.clone();
+        let exclude_before = self.cfg.dirs[dir].merge_exclude.clone();
         let mut open = true;
         // 标题栏的 ✕ 由 `open` 管，「确认」按钮另记一笔：Window::open 已经把 open 借走，
         // 闭包里再改就是同一份可变借用两次
         let mut close = false;
         let mut confirmed = false;
-        egui::Window::new(format!("差异过滤与提交屏蔽 · {label}"))
+        egui::Window::new(format!("差异过滤、提交屏蔽与合并范围 · {label}"))
             .open(&mut open)
-            .default_width(520.0)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
             .centered(ctx, "commit_rules")
             .show(ctx, |ui| {
+                // 四格输入框定死尺寸：宽度是窗口宽减去两侧窗框内边距（egui 默认 6），
+                // 高度约四行半、写满就地滚动；窗口本身不可拖，两页各摆两格，切页也不会跳高
+                let field = Vec2::new(548.0, 74.0);
                 ui.label(
-                    RichText::new("本目录的两套规则，都是一行一条、存在配置里长期生效：上面只管差异比较，下面决定会不会被提交。")
-                        .weak()
-                        .size(11.5),
+                    RichText::new(
+                        "本目录的四套规则均一行一条，保存于配置中长期生效，各管各的口径、互不牵连。分作两页只为少占屏幕，改动照样边写边存。",
+                    )
+                    .weak()
+                    .size(11.5),
                 );
                 ui.add_space(6.0);
-
-                ui.label(RichText::new("差异比对过滤条件 · 存本目录配置").strong().size(12.5));
-                let filter_field = ui.add(
-                    TextEdit::multiline(&mut dialog.filter_buf)
-                        .hint_text("-*.iml\n-.project\n-bin\\")
-                        .margin(field_margin(ui))
-                        .desired_rows(4)
-                        .min_size(Vec2::new(0.0, 78.0))
-                        .desired_width(f32::INFINITY),
-                );
-                if dialog.focus {
-                    filter_field.request_focus();
-                    dialog.focus = false;
-                }
-                ui.label(
-                    RichText::new(
-                        "写法照 Beyond Compare：`-` 开头是排除、`;` 分隔也认、结尾 \\ 是目录、`.\\` 锚定根目录、* 与 ? 通配。这一格只管差异比较，不影响会不会被提交。",
-                    )
-                    .weak()
-                    .size(11.0),
-                );
-                ui.aligned_row(|ui| {
-                    ui.label(RichText::new(diff_note).weak().size(11.0));
-                    if ui.button("清空筛选条件").clicked() {
-                        dialog.filter_buf.clear();
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(dialog.page == 0, "差异过滤与提交屏蔽")
+                        .on_hover_text("上格决定差异比对里看不看得到，下格决定条目进不进本次提交")
+                        .clicked()
+                    {
+                        dialog.page = 0;
+                    }
+                    if merge_on
+                        && ui
+                            .selectable_label(dialog.page == 1, "双向合并范围")
+                            .on_hover_text("划定双向合并涉及哪些文件：先按白名单放行，再按黑名单收回")
+                            .clicked()
+                    {
+                        dialog.page = 1;
                     }
                 });
-                ui.add_space(8.0);
-
-                ui.label(RichText::new("屏蔽可提交项 · 存本目录配置").strong().size(12.5));
-                ui.add(
-                    TextEdit::multiline(&mut self.cfg.dirs[dir].commit_excludes)
-                        .hint_text("bin\\\n*.log\n.\\auth.json")
-                        .margin(field_margin(ui))
-                        .desired_rows(4)
-                        .min_size(Vec2::new(0.0, 78.0))
-                        .desired_width(f32::INFINITY),
-                );
-                ui.label(
-                    RichText::new(
-                        "语法与上面同一套，但不用写 `-`（缺了自动补）；多段路径不带 `.`\\ 锚定会自动补上，否则永不命中。两处规则各存各的，改一边不动另一边。",
-                    )
-                    .weak()
-                    .size(11.0),
-                );
-                ui.aligned_row(|ui| {
+                ui.add_space(6.0);
+                if dialog.page == 0 {
+                    ui.label(RichText::new("差异比对过滤条件 · 存本目录配置").strong().size(12.5));
+                    let filter_field = rules_field(
+                        ui,
+                        "rules_filter",
+                        &mut dialog.filter_buf,
+                        "-*.iml\n-.project\n-bin\\",
+                        field,
+                    );
+                    if dialog.focus {
+                        filter_field.request_focus();
+                        dialog.focus = false;
+                    }
                     ui.label(
-                        RichText::new(if !read_once {
-                            "读取过本目录的修改状态后，这里才给得出命中数".to_owned()
-                        } else if hidden > 0 {
-                            format!("当前命中 {hidden} 项：不进提交清单，提交页上也看不到")
-                        } else {
-                            "当前未命中任何条目".to_owned()
-                        })
+                        RichText::new(
+                            "语法与 Beyond Compare 一致：`-` 开头表示排除，`;` 亦可分隔，结尾 \\ 表示目录，`.\\` 锚定根目录，* 与 ? 为通配符。此格仅作用于差异比较，不影响条目是否进入提交。",
+                        )
                         .weak()
                         .size(11.0),
                     );
-                    if ui.button("清空屏蔽规则").clicked() {
-                        self.cfg.dirs[dir].commit_excludes.clear();
-                    }
-                });
+                    ui.aligned_row(|ui| {
+                        ui.label(RichText::new(diff_note).weak().size(11.0));
+                        if ui.button("清空筛选条件").clicked() {
+                            dialog.filter_buf.clear();
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    ui.label(RichText::new("屏蔽可提交项 · 存本目录配置").strong().size(12.5));
+                    rules_field(
+                        ui,
+                        "rules_excludes",
+                        &mut self.cfg.dirs[dir].commit_excludes,
+                        "bin\\\n*.log\n.\\auth.json",
+                        field,
+                    );
+                    ui.label(
+                        RichText::new(
+                            "语法与上一格相同，无需书写 `-`（缺失时自动补全）；多段路径未带 `.`\\ 锚定时也会自动补上，否则不会命中。两格规则分别存储，互不影响。",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                    ui.aligned_row(|ui| {
+                        ui.label(
+                            RichText::new(if !read_once {
+                                "读取本目录的修改状态后即可显示命中数".to_owned()
+                            } else if hidden > 0 {
+                                format!("当前命中 {hidden} 项：不进入提交清单，提交页中亦不显示")
+                            } else {
+                                "当前未命中任何条目".to_owned()
+                            })
+                            .weak()
+                            .size(11.0),
+                        );
+                        if ui.button("清空屏蔽规则").clicked() {
+                            self.cfg.dirs[dir].commit_excludes.clear();
+                        }
+                    });
+                } else {
+                    ui.label(RichText::new("参与合并的文件 · 存本目录配置").strong().size(12.5));
+                    rules_field(
+                        ui,
+                        "rules_merge_include",
+                        &mut self.cfg.dirs[dir].merge_include,
+                        "*.java\n*.xml\nsrc\\main\\",
+                        field,
+                    );
+                    ui.label(
+                        RichText::new(
+                            "语法与「差异比对过滤条件」相同，无需书写 `+`（缺失时自动补全）。本格只划定「双向合并」涉及哪些文件，白名单外的差异原样保留；留空时按内置的代码与文本类型清单执行。",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                    ui.aligned_row(|ui| {
+                        if ui.button("清空白名单").clicked() {
+                            self.cfg.dirs[dir].merge_include.clear();
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    ui.label(RichText::new("不参与合并的文件 · 存本目录配置").strong().size(12.5));
+                    rules_field(
+                        ui,
+                        "rules_merge_exclude",
+                        &mut self.cfg.dirs[dir].merge_exclude,
+                        "target\\\n*.min.js\n.\\pom.xml",
+                        field,
+                    );
+                    ui.label(
+                        RichText::new(
+                            "语法与「屏蔽可提交项」相同。本格在白名单之后再次收窄范围：凡命中的差异均不参与合并，即使其同时满足白名单；留空时不额外排除。",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                    ui.aligned_row(|ui| {
+                        ui.label(
+                            RichText::new("不参与合并的条数见「双向合并」预览页脚的「不在范围 N 项」")
+                                .weak()
+                                .size(11.0),
+                        );
+                        if ui.button("清空黑名单").clicked() {
+                            self.cfg.dirs[dir].merge_exclude.clear();
+                        }
+                    });
+                }
                 ui.add_space(8.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add(egui::Button::new(RichText::new("确认").strong()))
                         .on_hover_text(
-                            "关掉窗口，并按刚写下的规则重读一次本目录：主页的「待提交 N」「本地差异 N」\
-                             和这里的命中数一起跟上",
+                            "关闭窗口，并按当前规则重新读取本目录：主页的「待提交 N」「本地差异 N」\
+                             与此处的命中数一并更新",
                         )
                         .clicked()
                     {
@@ -1583,6 +2343,14 @@ impl RepoApp {
             changed = true;
         }
         if self.cfg.dirs[dir].commit_excludes != excludes_before {
+            changed = true;
+        }
+        // 白名单只划合并范围，不影响差异数与提交清单，改过只要落盘
+        if self.cfg.dirs[dir].merge_include != merge_before {
+            changed = true;
+        }
+        // 黑名单是白名单之后的再收窄，落盘口径与白名单一致
+        if self.cfg.dirs[dir].merge_exclude != exclude_before {
             changed = true;
         }
         if changed {
@@ -1686,5 +2454,493 @@ mod tests {
         assert_eq!(app.cfg.dirs[0].tag_color, "");
         assert_eq!(app.cfg.dirs[1].tag, "冻结", "没勾的不受牵连");
         assert_eq!(app.cfg.dirs[1].tag_color, "#FF8040");
+    }
+
+    /// 只跑合并窗口那一帧：这扇窗挂在帧末，测试台那条路只跑主页，不补调就永远画不出来
+    fn merge_frame(
+        app: &mut RepoApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Rect)> {
+        let mut input = crate::testbed::base_input();
+        input.events = events;
+        let mut out = ctx.run_ui(input, |ui| app.merge_dialog(ui.ctx()));
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => {
+                    Some((text.galley.text().to_string(), item.shape.visual_bounding_rect()))
+                }
+                _ => None,
+            })
+            .filter(|(text, _)| !text.trim().is_empty())
+            .collect()
+    }
+
+    /// 插件没装时，合并窗口整扇收起（即使状态里还挂着 merge），而不是画一半；
+    /// 装回来要能立刻恢复
+    #[test]
+    fn the_merge_window_stays_shut_when_the_plugin_is_uninstalled() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_merge_plugin_test"),
+        );
+        let ctx = egui::Context::default();
+        let mut app = crate::testbed::stub_app(false);
+        app.merge = Some(crate::MergePreview {
+            dir: 0,
+            plan: Some(merge_fixture()),
+            ..Default::default()
+        });
+        // 移除双向合并（dll 不在 = 没装）
+        app.plugin_present = Some(false);
+        merge_frame(&mut app, &ctx, Vec::new());
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        let listed = |drawn: &[(String, egui::Rect)]| {
+            drawn.iter().any(|(text, _)| text.starts_with("文件清单"))
+        };
+        assert!(!listed(&drawn), "插件没装时不该画合并窗口");
+        assert!(app.merge.is_none(), "被挡住时要把窗口状态清掉，别留着下帧又冒出来");
+
+        // 装回来就恢复（把 dll 放回插件目录）
+        app.plugin_present = Some(true);
+        app.merge = Some(crate::MergePreview {
+            dir: 0,
+            plan: Some(merge_fixture()),
+            ..Default::default()
+        });
+        merge_frame(&mut app, &ctx, Vec::new());
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        assert!(listed(&drawn), "装回来后窗口要能画出来");
+    }
+
+    /// 入口也挡：插件没装时 open_merge 不能起预览任务、不能开窗口
+    #[test]
+    fn open_merge_is_refused_when_the_plugin_is_uninstalled() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_merge_plugin_open_test"),
+        );
+        let mut app = crate::testbed::stub_app(false);
+        app.plugin_present = Some(false);
+        app.open_merge(0);
+        assert!(app.merge.is_none(), "插件没装时不能开合并窗口");
+    }
+
+    fn has(drawn: &[(String, egui::Rect)], label: &str) -> bool {
+        drawn.iter().any(|(text, _)| text == label)
+    }
+
+    fn click_of(drawn: &[(String, egui::Rect)], label: &str) -> egui::Rect {
+        drawn
+            .iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| {
+                panic!(
+                    "窗口里没画出「{label}」：{:?}",
+                    drawn.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    /// 一份自造的清单：五种处置各一行，外加一行「已一致」——它只进页脚计数，不该占一行
+    fn merge_fixture() -> crate::merge::Plan {
+        use crate::merge::{Action, AncInfo, Entry, Finger, Plan, Region, RegionKind};
+        let finger = |size: u64, modified: u64| Some(Finger { size, modified });
+        Plan {
+            entries: vec![
+                Entry {
+                    rel: "src/a.java".to_owned(),
+                    display: r"src\A.java".to_owned(),
+                    local_rel: r"src\A.java".to_owned(),
+                    server_rel: "src/a.java".to_owned(),
+                    action: Action::MergeBoth,
+                    ancestor: AncInfo::Rev(190),
+                    regions: vec![Region {
+                        anc: (1, 2),
+                        local: Some((1, 2)),
+                        server: None,
+                        kind: RegionKind::LocalOnly,
+                    }],
+                    local: finger(120, 7),
+                    server: finger(140, 9),
+                    write_local: None,
+                    write_server: Some(b"merged".to_vec()),
+                    delete_local: false,
+                    delete_server: false,
+                    observed_local: None,
+                    observed_server: None,
+                    note: String::new(),
+                },
+                Entry {
+                    rel: "src/b.java".to_owned(),
+                    display: r"src\B.java".to_owned(),
+                    local_rel: r"src\B.java".to_owned(),
+                    server_rel: "src/b.java".to_owned(),
+                    action: Action::SkipConflict,
+                    ancestor: AncInfo::Base,
+                    regions: vec![Region {
+                        anc: (3, 4),
+                        local: Some((3, 4)),
+                        server: Some((3, 4)),
+                        kind: RegionKind::Conflict,
+                    }],
+                    local: finger(90, 5),
+                    server: finger(96, 6),
+                    write_local: None,
+                    write_server: None,
+                    delete_local: false,
+                    delete_server: false,
+                    observed_local: None,
+                    observed_server: None,
+                    note: String::new(),
+                },
+                Entry {
+                    rel: "src/c.java".to_owned(),
+                    display: r"src\C.java".to_owned(),
+                    local_rel: r"src\C.java".to_owned(),
+                    server_rel: "src/c.java".to_owned(),
+                    action: Action::SkipUndecided,
+                    ancestor: AncInfo::Unknown(crate::merge::Uncertain::WindowClosed {
+                        distance: 60,
+                        window: 15,
+                    }),
+                    regions: Vec::new(),
+                    local: finger(60, 3),
+                    server: finger(64, 4),
+                    write_local: None,
+                    write_server: None,
+                    delete_local: false,
+                    delete_server: false,
+                    observed_local: None,
+                    observed_server: None,
+                    note: "往回 15 版内都没有比基线更接近的状态（与基线差 60 行）".to_owned(),
+                },
+                Entry {
+                    rel: "src/d.java".to_owned(),
+                    display: r"src\D.java".to_owned(),
+                    local_rel: r"src\D.java".to_owned(),
+                    server_rel: "src/d.java".to_owned(),
+                    action: Action::SkipUnchanged,
+                    ancestor: AncInfo::Base,
+                    regions: Vec::new(),
+                    local: finger(50, 1),
+                    server: finger(50, 1),
+                    write_local: None,
+                    write_server: None,
+                    delete_local: false,
+                    delete_server: false,
+                    observed_local: None,
+                    observed_server: None,
+                    note: String::new(),
+                },
+                Entry {
+                    rel: "src/e.java".to_owned(),
+                    display: r"src\E.java".to_owned(),
+                    local_rel: r"src\E.java".to_owned(),
+                    server_rel: "src/e.java".to_owned(),
+                    action: Action::SkipBlacklisted,
+                    ancestor: AncInfo::NotNeeded,
+                    regions: Vec::new(),
+                    local: finger(70, 2),
+                    server: finger(80, 2),
+                    write_local: None,
+                    write_server: None,
+                    delete_local: false,
+                    delete_server: false,
+                    observed_local: None,
+                    observed_server: None,
+                    note: String::new(),
+                },
+            ],
+            local_root: std::path::PathBuf::from(r"D:\dev\hrp"),
+            server_root: std::path::PathBuf::from(r"C:\wc\hrp"),
+            checked: 5,
+            unverified: 1,
+            outside_whitelist: 2,
+            blacklisted: 1,
+            ..Default::default()
+        }
+    }
+
+    /// 合并预览窗口：清单逐行按处置画出来、页脚按实报数，「已一致」只进计数不占行。
+    /// 清单是 take 出来用完再放回去的，少放一次就是窗口每帧自己关掉；
+    /// 「应用并备份」第一下只把按钮换成确认，绝不能已经起了写任务
+    #[test]
+    fn merge_window_lists_the_plan_and_asks_before_writing() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_merge_window_test"),
+        );
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let mut app = crate::testbed::stub_app(false);
+        app.merge = Some(crate::MergePreview {
+            dir: 0,
+            plan: Some(merge_fixture()),
+            ..Default::default()
+        });
+
+        // 弹层第一帧只用于稳定形状，断言读第二帧
+        merge_frame(&mut app, &ctx, Vec::new());
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        for label in [
+            "冲突",
+            "差异过多",
+            "黑名单内",
+            r"src\A.java",
+            r"src\B.java",
+            r"src\C.java",
+            r"src\E.java",
+            "r190",
+            "本地 1 处",
+            "本地 4–4 / 服务器 4–4",
+            "写入",
+            "合入服务器",
+            "行级合并",
+            "整文件覆盖",
+            "新增拷入",
+            "跳过",
+            "冲突",
+            "待人工",
+            "两边都改",
+            "不在范围",
+            "已一致",
+            "应用并备份",
+        ] {
+            assert!(has(&drawn, label), "窗口里应有「{label}」");
+        }
+        assert!(
+            !has(&drawn, r"src\D.java"),
+            "已一致的那份只进汇总计数，不该占文件清单的一行"
+        );
+        assert!(
+            app.merge.is_some() && app.merge.as_ref().unwrap().plan.is_some(),
+            "清单要在窗口里留住，不是每帧取出来就丢了"
+        );
+
+        let apply = click_of(&drawn, "应用并备份");
+        merge_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(apply.center()),
+                egui::Event::PointerButton {
+                    pos: apply.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: apply.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            !app.pool.is_writing(0),
+            "第一下只该亮出确认，不能已经起了写任务"
+        );
+        assert!(app.merge.as_ref().unwrap().confirm, "第一下要进入待确认态");
+        // 确认那颗按钮是下一帧才画出来的：点击这一帧画的还是「应用并备份」
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        assert!(
+            has(&drawn, "确认写入 1 项"),
+            "第二下的按钮要写明写入几项"
+        );
+    }
+
+    /// 在 `rect` 中心走一遍「移过去 → 按下 → 抬起」，一帧内点完一颗按钮
+    fn click(events: &mut Vec<egui::Event>, rect: egui::Rect) {
+        events.push(egui::Event::PointerMoved(rect.center()));
+        events.push(egui::Event::PointerButton {
+            pos: rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        events.push(egui::Event::PointerButton {
+            pos: rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+
+    /// 最大化要的是「清单多看几十行」，不是把窗口拉大完事：多出来的那一截得落在清单视口上，
+    /// 页脚跟着往下走、仍然贴在窗口下沿。页脚高度是上一帧实量的，所以比的是再画一帧之后的几何
+    #[test]
+    fn maximizing_the_merge_window_gives_the_extra_height_to_the_list() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_merge_zoom_test"),
+        );
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let mut app = crate::testbed::stub_app(false);
+        app.merge = Some(crate::MergePreview {
+            dir: 0,
+            plan: Some(merge_fixture()),
+            ..Default::default()
+        });
+        let window = || {
+            ctx.memory(|m| m.area_rect(egui::Id::new("merge")))
+                .expect("窗口矩形")
+        };
+        merge_frame(&mut app, &ctx, Vec::new());
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        let normal = window();
+        // 清单最后一行与页脚首行之间的空白 = 清单视口里没被行占满的那截。
+        // 最大化时窗口顶边也一起上移，所以不能拿页脚的绝对高度说话
+        // 清单卡片吃满窗口剩下的高度：最大化之后「标题到窗口下沿」这一截变长，
+        // 多出来的高度就都进了清单视口（标题位置基本不动，所以比的是它到窗口底的距离）
+        let slack = |drawn: &[(String, egui::Rect)]| {
+            window().max.y - click_of(drawn, "文件清单（4）").max.y
+        };
+        let before = slack(&drawn);
+
+        let mut events = Vec::new();
+        click(&mut events, click_of(&drawn, "最大化"));
+        merge_frame(&mut app, &ctx, events);
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        let max = window();
+        assert!(has(&drawn, "还原大小"), "最大化之后那一枚要改口成「还原大小」");
+        assert!(
+            max.height() > normal.height() + 100.0,
+            "窗口该铺满工作区：{normal:?} → {max:?}"
+        );
+        assert!(
+            slack(&drawn) > before + 100.0,
+            "多出来的高度该全进清单视口：标题到窗口底 {before} → {}",
+            slack(&drawn)
+        );
+        assert!(
+            has(&drawn, r"src\E.java"),
+            "最大化之后清单视野更高，黑名单那份也该露出来"
+        );
+
+        let mut events = Vec::new();
+        click(&mut events, click_of(&drawn, "还原大小"));
+        merge_frame(&mut app, &ctx, events);
+        // 还原只写一帧矩形，之后靠 egui 自己记住的位置：多跑一帧确认它没滑回去
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        let back = window();
+        let drift = (back.min - normal.min).length() + (back.max - normal.max).length();
+        assert!(drift < 1.0, "还原要回最大化之前那个矩形：{normal:?} → {back:?}");
+        assert!(
+            has(&drawn, "我已确认无误，直接合并") && back.contains(click_of(&drawn, "我已确认无误，直接合并").center()),
+            "还原后内容要跟着窗口一起回到原位"
+        );
+    }
+
+    /// 「我已确认无误，直接合并」把确认写在字面上：一次点击就起写任务，不再亮第二颗确认按钮。
+    /// 这份清单的两个根目录都指到临时区，落盘前的指纹重查必然对不上，后台那一趟一个字节也写不下去
+    #[test]
+    fn the_direct_merge_starts_writing_on_the_first_click() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_merge_direct_test"),
+        );
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let mut app = crate::testbed::stub_app(false);
+        let scratch = std::env::temp_dir().join("repo_manager_merge_direct_scratch");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let mut plan = merge_fixture();
+        plan.local_root = scratch.join("local");
+        plan.server_root = scratch.join("server");
+        app.merge = Some(crate::MergePreview {
+            dir: 0,
+            plan: Some(plan),
+            ..Default::default()
+        });
+        merge_frame(&mut app, &ctx, Vec::new());
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        let mut events = Vec::new();
+        click(&mut events, click_of(&drawn, "我已确认无误，直接合并"));
+        merge_frame(&mut app, &ctx, events);
+        assert!(
+            app.pool.has(Kind::ApplyMerge, 0),
+            "这一颗该一次点到位，直接起写任务"
+        );
+        assert!(
+            !app.merge.as_ref().unwrap().confirm,
+            "不备份这条路没有待确认态"
+        );
+        // 等后台那一趟真跑完再验盘，断言才不是蒙对的
+        for _ in 0..200 {
+            if !app.pool.poll().done.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !scratch.join("local").exists() && !scratch.join("server").exists(),
+            "预览之后的样子对不上，一个字节都不该落下去"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// 「清理备份」和写入一样分两步：第一下只把确认亮出来，条数与体积都按已完成的几次算，
+    /// 写到一半断掉的那次不进确认；第二下才真的起删除任务
+    #[test]
+    fn cleaning_backups_arms_the_confirm_before_deleting() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_merge_clean_test"),
+        );
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let mut app = crate::testbed::stub_app(false);
+        let backup = |name: &str, bytes: u64, unfinished: bool| crate::merge::BackupInfo {
+            dir: std::env::temp_dir().join(name),
+            name: name.to_owned(),
+            files: 1,
+            bytes,
+            unfinished,
+        };
+        app.merge = Some(crate::MergePreview {
+            dir: 0,
+            plan: Some(merge_fixture()),
+            backups: vec![
+                backup("merge-backup-20260102-120000", 4096, false),
+                backup("merge-backup-20260101-120000", 5120, true),
+            ],
+            ..Default::default()
+        });
+        merge_frame(&mut app, &ctx, Vec::new());
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        let mut events = Vec::new();
+        click(&mut events, click_of(&drawn, "清理备份"));
+        merge_frame(&mut app, &ctx, events);
+        assert!(
+            !app.pool.has(Kind::CleanBackup, 0),
+            "第一下只该亮确认，不能已经删起来了"
+        );
+        assert!(app.merge.as_ref().unwrap().wipe, "第一下要进入待确认态");
+        let drawn = merge_frame(&mut app, &ctx, Vec::new());
+        assert!(
+            has(&drawn, "删掉这 1 次备份（约 4 KB）？"),
+            "确认只算已完成的那次，未完成那条是还原凭据"
+        );
+        let mut events = Vec::new();
+        click(&mut events, click_of(&drawn, "确认清理"));
+        merge_frame(&mut app, &ctx, events);
+        assert!(
+            app.pool.has(Kind::CleanBackup, 0),
+            "第二下才起删除任务"
+        );
+        assert!(!app.merge.as_ref().unwrap().wipe, "确认点完就把确认行收掉");
     }
 }

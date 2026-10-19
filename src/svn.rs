@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -5,6 +6,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use encoding_rs::GBK;
+
+use crate::merge::{Ancestor, WcState};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -364,6 +367,9 @@ pub fn parse_status(xml: &str, base: &Path) -> Vec<StatusEntry> {
                 .and_then(|s| s.attribute("item"))
                 .unwrap_or("none"),
         );
+        let item = if status.as_ref().and_then(|s| s.attribute("tree-conflicted")) == Some("true") {
+            Item::Conflict
+        } else { item };
         let props = status
             .as_ref()
             .and_then(|s| s.attribute("props"))
@@ -808,32 +814,65 @@ impl Svn {
     /// 取工作副本 BASE 版本的原始内容写到 `to`，供 Beyond Compare 之类外部工具对比。
     /// `svn cat -r BASE` 读的是本地 pristine 存储，不走网络。
     pub fn cat_base(&self, path: &Path, to: &Path) -> Result<(), String> {
+        let bytes = self
+            .cat_bytes("BASE", path)?
+            .ok_or_else(|| format!("{} 没有 BASE 版本", path.display()))?;
+        fs::write(to, bytes).map_err(|e| e.to_string())
+    }
+
+    /// `svn cat -r <revspec> <path>` 的**字节**版。`capture` 经 `decode_bytes` 是有损解码，
+    /// 定岔要按字节比祖先，不能走那条。
+    /// `Ok(None)` = 这一版上没有这个文件（文件比它晚才出现，或工作副本里它还没有 BASE），
+    /// `Err` = 命令真失败了（连不上服务器、认证被拒）。
+    /// 这个分界决定定岔是「跳过这一版继续往回走」还是「整轮判成没连上服务器」，
+    /// 判错方向会把一次网络故障说成「这个文件没有基线」。
+    pub(crate) fn cat_bytes(&self, revspec: &str, path: &Path) -> Result<Option<Vec<u8>>, String> {
+        self.cat_bytes_limited(revspec, path, u64::MAX)
+    }
+
+    fn cat_bytes_limited(&self, revspec: &str, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
         let mut args = self.global();
         args.extend([
             "cat".to_owned(),
             "-r".to_owned(),
-            "BASE".to_owned(),
+            revspec.to_owned(),
             path.to_string_lossy().into_owned(),
         ]);
-        let output = match self
-            .command(&args, None)
+        let (status, bytes, stderr) = self.raw_limited(&args, limit)?;
+        if status.success() { return Ok(Some(bytes)) }
+        let err = decode_bytes(&stderr);
+        if says_missing(&err) { Ok(None) } else { Err(err.trim().to_owned()) }
+    }
+
+    fn raw_limited(&self, args: &[String], limit: u64) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+        let mut child = match self
+            .command(args, None)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(child) => {
-                crate::childproc::attach(&child);
-                child
-                    .wait_with_output()
-                    .map_err(|e| format!("等待 {} 结束失败：{}", self.exe.display(), e))?
-            }
+            Ok(child) => child,
             Err(e) => return Err(format!("无法启动 {}：{}", self.exe.display(), e)),
         };
-        if !output.status.success() {
-            return Err(decode_bytes(&output.stderr).trim().to_owned());
-        }
-        std::fs::write(to, &output.stdout).map_err(|e| e.to_string())
+        crate::childproc::attach(&child);
+        let stderr = child.stderr.take().ok_or("无法读取 SVN 错误输出")?;
+        let errors = std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut bytes = Vec::new();
+            let result = (&mut stderr).take(1024 * 1024).read_to_end(&mut bytes);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            result.map(|_| bytes)
+        });
+        let mut bytes = Vec::new();
+        let read = child.stdout.take().ok_or("无法读取 SVN 文件内容")?.take(limit.saturating_add(1)).read_to_end(&mut bytes);
+        if read.is_err() || bytes.len() as u64 > limit { let _ = child.kill(); }
+        let status = child.wait().map_err(|e| format!("等待 SVN 结束失败：{e}"))?;
+        let stderr = errors.join().map_err(|_| "读取 SVN 错误输出失败")?.map_err(|e| e.to_string())?;
+        read.map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > limit { return Err(format!("命令输出超过读取上限 {limit} 字节")); }
+        Ok((status, bytes, stderr))
     }
+
 
     pub fn cleanup(&self, dir: &Path, on_line: &dyn Fn(&str)) -> Run {
         self.call_stream(&["cleanup", &dir.to_string_lossy()], None, on_line)
@@ -955,6 +994,231 @@ impl Svn {
         let _ = fs::remove_file(&message_file);
         run
     }
+}
+
+// --------------------------------------------------------------- 合并用的祖先来源
+
+/// `svn cat` 报「这一版上没有这个文件」的几种原文。错误码随 svn 版本与命令路径而变，
+/// 认不出来的一律当命令失败：把一次网络故障误判成「没有基线」会让报告指错处置方向。
+fn says_missing(err: &str) -> bool {
+    let text = err.to_lowercase();
+    [
+        "e160013",
+        "e200009",
+        "not found at revision",
+        "not found in revision",
+        "does not exist in",
+        "non-existent in",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// `merge::Ancestor` 的 svn 实现。
+///
+/// 状态表取自构造时那一次 `svn status --xml <root>`：svn 只把**非正常**条目列出来，
+/// 所以「表里没有 + 盘上存在」就是正常版本化，「表里没有 + 盘上也没有」就是不在工作副本里。
+/// 整棵树只走这一遍，几百个文件共用一张表。
+/// `status` 命令本身失败时（`error()` 给出原因），盘上的文件一概按「非常规状态」处理：
+/// 宁可整片跳过，也不把内容写进一个可能正冲突、或已计划删除的文件。
+pub struct SvnAncestor {
+    svn: Svn,
+    root: PathBuf,
+    states: HashMap<String, WcState>,
+    failed: Option<String>,
+    property_modified: Vec<String>,
+}
+
+impl SvnAncestor {
+    pub fn new_local(svn: Svn, root: &Path) -> Self {
+        let mut anc = Self::new(svn, root);
+        // status 对普通目录可能以成功退出、仅输出 warning，不能仅靠退出码确认版本化。
+        let (info, run) = anc.svn.info(&root.to_string_lossy());
+        if info.is_some() && run.ok {
+            return anc;
+        }
+        let reason = format!("{}\n{}", run.out, run.err);
+        // 只将明确的“不是工作副本/节点未版本化”识别为普通目录；认证、权限等错误仍保留。
+        if root.is_dir() && ["E155007", "W155007", "W155010"].iter().any(|code| reason.contains(code)) {
+            anc.failed = None;
+            anc.states.clear();
+            anc.states.insert(String::new(), WcState::Unversioned);
+        } else {
+            anc.failed = Some(run.summary());
+        }
+        anc
+    }
+
+    pub fn new(svn: Svn, root: &Path) -> Self {
+        // Ignored directories must be represented too: otherwise their children
+        // look like normal versioned files and may be mistaken for deletions.
+        let run = svn.call(&["status", "--xml", "--no-ignore", &root.to_string_lossy()], None);
+        let entries = if run.ok { parse_status(&run.out, root) } else { Vec::new() };
+        let failed = if !run.ok || run.err.contains("W155007") {
+            Some(run.summary())
+        } else {
+            roxmltree::Document::parse(&run.out).err().map(|e| format!("工作副本状态 XML 无效：{e}"))
+        };
+        let mut states = state_table(&entries, root);
+        if let Ok(doc) = roxmltree::Document::parse(&run.out) {
+            for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+                if entry.children().any(|n| n.has_tag_name("wc-status") && n.attribute("switched") == Some("true")) {
+                    if let Some(raw) = entry.attribute("path") {
+                        let path = Path::new(raw);
+                        let rel = path.strip_prefix(root).unwrap_or(path);
+                        let key = rel_key(rel);
+                        // 绑定目录本身的 URL 由 binding 核对；内部 switched 子树需先人工处理。
+                        if !key.is_empty() { states.insert(key, WcState::Other); }
+                    }
+                }
+            }
+        }
+        Self {
+            states,
+            root: root.to_path_buf(),
+            failed,
+            property_modified: entries.iter().filter(|e| matches!(e.props.as_str(), "modified" | "conflicted"))
+                .map(|e| rel_key(Path::new(&e.path).strip_prefix(root).unwrap_or(Path::new(&e.path)))).collect(),
+            svn,
+        }
+    }
+
+    /// 状态表没读出来时给调用方的原因：这个功能整个跑不起来，别一边跑一边报「无基线」
+    pub fn error(&self) -> Option<&str> {
+        self.failed.as_deref()
+    }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.root.join(rel)
+    }
+}
+
+/// 状态表按「小写 + `/` 分隔的相对路径」存，和 `localdiff` 的 rel 同一坐标系；
+/// svn 只把非正常条目列出来，所以这张表是一份覆盖用的例外清单
+fn state_table(entries: &[StatusEntry], root: &Path) -> HashMap<String, WcState> {
+    let mut states = HashMap::new();
+    for entry in entries {
+        let path = Path::new(&entry.path);
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let key = rel_key(rel);
+        let state = if entry.props == "conflicted" { WcState::Conflict } else { state_of(entry.item) };
+        if !key.is_empty() || state != WcState::Normal {
+            states.insert(key, state);
+        }
+    }
+    states
+}
+
+fn rel_key(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+/// svn 的条目状态映射到合并功能的处置口径
+fn state_of(item: Item) -> WcState {
+    match item {
+        Item::Normal | Item::Modified => WcState::Normal,
+        Item::Added => WcState::Added,
+        Item::Unversioned => WcState::Unversioned,
+        Item::Deleted | Item::Missing => WcState::Deleted,
+        Item::Conflict => WcState::Conflict,
+        Item::Replaced | Item::Ignored | Item::External | Item::Incomplete | Item::Other => WcState::Other,
+    }
+}
+
+impl Ancestor for SvnAncestor {
+    fn metadata(&self) -> Result<Option<crate::merge::Metadata>, String> {
+        if let Some(reason) = &self.failed { return Err(reason.clone()) }
+        if self.states.get("") == Some(&WcState::Unversioned) { return Ok(None) }
+        let mut args = self.svn.global();
+        args.extend(["proplist".into(), "--xml".into(), "--verbose".into(), "--recursive".into(), self.root.to_string_lossy().into_owned()]);
+        let (status, raw, stderr) = self.svn.raw_limited(&args, 16 * 1024 * 1024)?;
+        if !status.success() { return Err(decode_bytes(&stderr)) }
+        let text = std::str::from_utf8(&raw).map_err(|e| e.to_string())?;
+        let doc = roxmltree::Document::parse(text).map_err(|e| format!("SVN 属性 XML 无效：{e}"))?;
+        let mut metadata = crate::merge::Metadata::new();
+        for target in doc.descendants().filter(|n| n.has_tag_name("target")) {
+            let path = Path::new(target.attribute("path").ok_or("SVN 属性缺少路径")?);
+            let key = rel_key(path.strip_prefix(&self.root).unwrap_or(path));
+            let mut properties = std::collections::BTreeMap::new();
+            for prop in target.children().filter(|n| n.has_tag_name("property")) {
+                let name = prop.attribute("name").ok_or("SVN 属性缺少名称")?;
+                properties.insert(name.to_owned(), format!("{}:{}", prop.attribute("encoding").unwrap_or("text"), prop.text().unwrap_or("")));
+            }
+            if !properties.is_empty() { metadata.insert(key, properties); }
+        }
+        Ok(Some(metadata))
+    }
+
+    fn pending_properties(&self) -> Vec<String> { self.property_modified.clone() }
+
+    fn binding(&self) -> Result<Option<crate::merge::RepositoryBinding>, String> {
+        if let Some(reason) = &self.failed { return Err(reason.clone()) }
+        if self.states.get("") == Some(&WcState::Unversioned) { return Ok(None) }
+        let run = self.svn.call(&["info", "--xml", &self.root.to_string_lossy()], None);
+        if !run.ok { return Err(run.summary()) }
+        let doc = roxmltree::Document::parse(&run.out).map_err(|e| format!("SVN 身份信息无效：{e}"))?;
+        let uuid = first_text(&doc, "uuid");
+        let url = first_text(&doc, "url");
+        if uuid.is_empty() || url.is_empty() { return Err("SVN 身份缺少仓库 UUID 或 URL".into()) }
+        Ok(Some(crate::merge::RepositoryBinding { uuid, url }))
+    }
+
+    fn validation_client(&self) -> Option<Svn> { Some(self.svn.clone()) }
+
+    fn wc_state(&self, rel: &str, exists: bool) -> WcState {
+        if self.failed.is_some() {
+            return WcState::Other;
+        }
+        let key = rel_key(Path::new(rel));
+        let mut current = key.as_str();
+        let mut found = None;
+        loop {
+            if let Some(state) = self.states.get(current) {
+                // SVN may report only the directory for unversioned, missing,
+                // deleted or conflicted subtrees. Its children inherit that state.
+                if !state.writable() {
+                    return *state;
+                }
+                if found.is_none() && (current == key || *state != WcState::Normal) {
+                    found = Some(*state);
+                }
+            }
+            if current.is_empty() {
+                break;
+            }
+            current = current.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+        }
+        found.unwrap_or(if exists { WcState::Normal } else { WcState::Absent })
+    }
+
+    fn base(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+        self.svn.cat_bytes_limited("BASE", &self.path(rel), crate::merge::MAX_FILE_BYTES)
+    }
+
+    /// `-r BASE:1` 是 svn 对工作副本路径的默认区间，写成「新 → 旧」才能让 `-l` 留下最近的那几版
+    /// （正序时 `-l` 保留的是区间里最旧的 N 条）。第一条就是 BASE 内容来自的那一版，
+    /// 调用方已经比过 BASE，再 cat 一次只是白花一趟网络往返 ⇒ 丢掉。
+    fn revs(&self, rel: &str, max: usize) -> Result<Vec<u64>, String> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let target = self.path(rel).to_string_lossy().into_owned();
+        let (log, run) = self.svn.log_in(&target, "BASE:1", max as i64 + 1, "");
+        if !run.ok {
+            return Err(run.summary());
+        }
+        Ok(log
+            .iter()
+            .filter_map(|entry| entry.revision.trim().parse::<u64>().ok())
+            .skip(1)
+            .take(max)
+            .collect())
+    }
+
+    fn at_rev(&self, rel: &str, rev: u64) -> Result<Option<Vec<u8>>, String> {
+        self.svn.cat_bytes_limited(&rev.to_string(), &self.path(rel), crate::merge::MAX_FILE_BYTES)
+    }
+
 }
 
 // ------------------------------------------------------------------------ 自动寻找 svn.exe
@@ -1411,5 +1675,130 @@ mod tests {
             format!("merge -r HEAD:7 --accept postpone {path} {path}"),
             "路径要写两遍，一遍合并源一遍合并目标"
         );
+    }
+
+    /// 「这一版上没有这个文件」让定岔继续往回走，「命令失败」让整轮判成没连上服务器：
+    /// 两者混在一起时，一次断网会被报成「这个文件没有基线」，处置方向完全错开
+    #[test]
+    fn a_missing_file_is_not_reported_as_a_failed_command() {
+        for text in [
+            "svn: E160013: File 'Foo.java' is not found at revision 200;",
+            "svn: E160013: Foo.java does not exist in revision 190",
+            "svn: E200009: Can't open 'Foo.java'",
+        ] {
+            assert!(says_missing(text), "{text} 说的是这一版上没有");
+        }
+        for text in [
+            "svn: E170013: Unable to connect to a repository at URL 'https://10.0.0.1/svn/hrp'",
+            "svn: E215004: No more credentials or we tried really bad ones twice",
+            "",
+        ] {
+            assert!(!says_missing(text), "{text} 是命令失败，不能当成没有基线");
+        }
+    }
+
+    /// 状态表是一份「例外清单」：svn 只列非正常条目，所以表里的状态要按归一化后的 rel 命中，
+    /// 表外的要按「盘上有没有」分成正常版本化与不在工作副本里
+    #[test]
+    fn the_state_table_lists_only_what_svn_flagged() {
+        let root = Path::new(r"D:\wc");
+        let entry = |rel: &str, item: Item| StatusEntry {
+            path: root.join(rel).display().to_string(),
+            name: rel.to_owned(),
+            item,
+            props: "none".to_owned(),
+            checked: false,
+        };
+        let states = state_table(
+            &[
+                entry(r"HRP.Web\build\Foo.java", Item::Conflict),
+                entry("gone.txt", Item::Missing),
+                entry("added.txt", Item::Added),
+                entry("fresh.txt", Item::Unversioned),
+                entry("ignored.txt", Item::Ignored),
+                entry("", Item::Normal),
+            ],
+            root,
+        );
+        assert_eq!(states.len(), 5, "工作副本根目录自己那条不是一格");
+        let anc = SvnAncestor {
+            svn: client(),
+            root: root.to_path_buf(),
+            states,
+            property_modified: Vec::new(), failed: None,
+        };
+        assert_eq!(
+            anc.wc_state(r"HRP.Web\Build\FOO.JAVA", true),
+            WcState::Conflict,
+            "大小写与分隔符都不能挡住命中"
+        );
+        assert_eq!(anc.wc_state("gone.txt", true), WcState::Deleted, "已丢失按已计划删除处置");
+        assert_eq!(anc.wc_state("ignored.txt", true), WcState::Other);
+        assert_eq!(anc.wc_state("quiet.txt", true), WcState::Normal, "表里没有 + 盘上有 = 正常版本化");
+        assert_eq!(anc.wc_state("fresh.txt", false), WcState::Unversioned, "表里的状态优先于盘上有没有");
+        assert_eq!(anc.wc_state("newcomer.txt", false), WcState::Absent, "要拷进去的新目标");
+    }
+
+    /// 状态表根本没读出来时（这条目录不是工作副本、svn 报错），一个文件都不许判成可写
+    #[test]
+    fn an_unreadable_state_table_writes_nothing() {
+        let anc = SvnAncestor {
+            svn: client(),
+            root: PathBuf::from(r"D:\nope"),
+            states: HashMap::new(),
+            property_modified: Vec::new(), failed: Some("svn: E155007: is not a working copy".to_owned()),
+        };
+        assert_eq!(anc.wc_state("Foo.java", true), WcState::Other);
+        assert_eq!(anc.wc_state("Foo.java", false), WcState::Other);
+        assert!(anc.error().is_some(), "读不到状态的原因要能交给上层说明");
+    }
+
+    #[test]
+    fn directory_states_apply_to_descendants_without_matching_sibling_prefixes() {
+        for state in [WcState::Deleted, WcState::Unversioned, WcState::Conflict, WcState::Other, WcState::Added] {
+            let anc = SvnAncestor {
+                svn: client(),
+                root: PathBuf::from(r"D:\wc"),
+                states: HashMap::from([("src/gone".to_owned(), state)]),
+                property_modified: Vec::new(), failed: None,
+            };
+            assert_eq!(anc.wc_state(r"Src\Gone\nested\File.java", true), state);
+            assert_eq!(anc.wc_state("src/gone/nested/file.java", false), state);
+            assert_eq!(anc.wc_state("src/gone_other/file.java", true), WcState::Normal);
+        }
+    }
+
+    #[test]
+    fn an_unversioned_root_does_not_make_its_files_versioned() {
+        let anc = SvnAncestor {
+            svn: client(),
+            root: PathBuf::from(r"D:\wc"),
+            states: HashMap::from([("".to_owned(), WcState::Unversioned)]),
+            property_modified: Vec::new(), failed: None,
+        };
+        assert_eq!(anc.wc_state("src/file.java", true), WcState::Unversioned);
+    }
+
+    #[test]
+    fn a_tree_conflict_overrides_an_ordinary_child_status() {
+        let root = Path::new(r"D:\wc");
+        let xml = r#"<status><target path="D:\wc">
+            <entry path="D:\wc\src"><wc-status item="normal" props="none" tree-conflicted="true"/></entry>
+            <entry path="D:\wc\src\a.java"><wc-status item="modified" props="none"/></entry>
+        </target></status>"#;
+        let entries = parse_status(xml, root);
+        let anc = SvnAncestor { svn: client(), root: root.to_path_buf(),
+            states: state_table(&entries, root), property_modified: Vec::new(), failed: None };
+        assert_eq!(anc.wc_state("src/a.java", true), WcState::Conflict);
+    }
+
+    #[test]
+    fn a_root_property_conflict_blocks_children_and_replaced_nodes_need_review() {
+        let root = Path::new(r"D:\wc");
+        let entry = StatusEntry { path: root.display().to_string(), name: "wc".into(),
+            item: Item::Normal, props: "conflicted".into(), checked: false };
+        let anc = SvnAncestor { svn: client(), root: root.to_path_buf(), states: state_table(&[entry], root), property_modified: Vec::new(), failed: None };
+        assert_eq!(anc.wc_state("src/a.java", true), WcState::Conflict);
+        assert_eq!(state_of(Item::Replaced), WcState::Other);
     }
 }

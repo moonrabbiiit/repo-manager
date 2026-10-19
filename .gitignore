@@ -1,4 +1,7 @@
 /target
+# 插件 dll 由 build.cmd 从 target 复制过来，属于构建产物
+/plugin/*.dll
+/plugin/*.incoming
 /tools/*
 # 发布/更新相关脚本要入库（其余 tools 下内容如 mingw64 工具链仍忽略）
 !/tools/update_server.py

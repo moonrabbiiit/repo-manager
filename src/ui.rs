@@ -174,8 +174,11 @@ pub fn tune_style(style: &mut egui::Style, accent: Color32) {
     style.spacing.button_padding = Vec2::new(10.0, 5.0);
     style.spacing.scroll.bar_width = 8.0;
 
-    // 字号层级：正文与按钮抬到 13（各处显式 .size() 的地方不受影响）
+    // 字号层级：正文与按钮抬到 13（各处显式 .size() 的地方不受影响）；
+    // 弹窗标题走 Heading，出厂 20 在一扇 560 宽的窗里太压人，也会把标题栏撑高、
+    // 让右上角那枚 14 的叉只剩正中一小点能点着，收到 14 正好占满标题那一带
     for (text_style, size) in [
+        (egui::TextStyle::Heading, 14.0),
         (egui::TextStyle::Body, 13.0),
         (egui::TextStyle::Button, 13.0),
         (egui::TextStyle::Small, 12.0),

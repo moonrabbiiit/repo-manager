@@ -16,6 +16,9 @@ encoding_rs = "0.8.35"
 rfd = "0.17.2"
 regex = "1.13.1"
 
+# 插件宿主：按名取 dll 里的 C ABI 符号
+libloading = "0.8"
+
 # 右上角那排 SVG 图标：resvg 把内嵌的 svg 解析 + 栅格化成 egui 贴图。
 # 关掉 text / 系统字体等重特性：图标里只有 path / circle / line，纯 Rust、不碰 C
 resvg = { version = "0.45", default-features = false }
@@ -30,7 +33,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # WM_NCHITTEST 自己判命中、按窗口 DPI 换算边框宽）
 # raw-window-handle 本来就在依赖树里（eframe 依赖），这里只是要它的 HasWindowHandle trait 取 HWND
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }
 # 目录更新订阅的系统通知：WinRT Toast，免打包用 PowerShell 的应用身份弹
 tauri-winrt-notification = "0.7"
 raw-window-handle = "0.6"
@@ -40,3 +43,7 @@ opt-level = 2
 lto = "thin"
 codegen-units = 8
 strip = true
+
+[workspace]
+members = ["crates/merge-plugin", "crates/ai-log-plugin"]
+resolver = "2"

@@ -504,65 +504,69 @@ impl RepoApp {
                             self.persist();
                         }
                     });
-                    ui.collapsing("AI 日志（调用 AI 生成工作日志）", |ui| {
-                        ui.label(
-                            RichText::new(
-                                "在历史页勾选本人提交，把「文件名 + 修改内容」发给 AI 整理成工作日志。\n\
-                                 接口需兼容 OpenAI /chat/completions 格式（DeepSeek、通义、Kimi 等均支持）；\
-                                 只填 base 地址也行，程序会自动补全 /chat/completions。\
-                                 密钥保存在本机配置文件，请求经系统 curl 发送。",
-                            )
-                            .size(11.5)
-                            .weak(),
-                        );
-                        ui.aligned_row(|ui| {
-                            ui.label("服务地址");
+                    // 插件没装时这块配置一起收起，免得配了也没处用
+                    if self.plugin_installed(crate::plugins::PluginId::AiLog) {
+                        ui.collapsing("AI 日志（调用 AI 生成工作日志）", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "在历史页勾选本人提交，把「文件名 + 修改内容」发给 AI 整理成工作日志。\n\
+                                     接口需兼容 OpenAI /chat/completions 格式（DeepSeek、通义、Kimi 等均支持）；\
+                                     只填 base 地址也行，程序会自动补全 /chat/completions。\
+                                     密钥保存在本机配置文件，请求经系统 curl 发送。",
+                                )
+                                .size(11.5)
+                                .weak(),
+                            );
+                            ui.aligned_row(|ui| {
+                                ui.label("服务地址");
+                                ui.add(
+                                    TextEdit::singleline(&mut self.cfg.ai_url)
+                                        .hint_text(
+                                            "如 https://api.deepseek.com（通义：https://dashscope.aliyuncs.com/compatible-mode/v1）",
+                                        )
+                                        .margin(field_margin(ui))
+                                        .desired_width((ui.available_width() - 90.0).max(180.0)),
+                                );
+                            });
+                            ui.aligned_row(|ui| {
+                                ui.label("API Key");
+                                ui.add(
+                                    TextEdit::singleline(&mut self.cfg.ai_key)
+                                        .password(true)
+                                        .hint_text("sk-…")
+                                        .margin(field_margin(ui))
+                                        .desired_width((ui.available_width() - 90.0).max(180.0)),
+                                );
+                            });
+                            ui.aligned_row(|ui| {
+                                ui.label("模型名  ");
+                                ui.add(
+                                    TextEdit::singleline(&mut self.cfg.ai_model)
+                                        .hint_text("如 deepseek-chat / gpt-4o-mini / qwen-plus")
+                                        .margin(field_margin(ui))
+                                        .desired_width((ui.available_width() - 90.0).max(180.0)),
+                                );
+                            });
+                            ui.label(RichText::new("口吻").size(11.5).weak());
                             ui.add(
-                                TextEdit::singleline(&mut self.cfg.ai_url)
-                                    .hint_text(
-                                        "如 https://api.deepseek.com（通义：https://dashscope.aliyuncs.com/compatible-mode/v1）",
-                                    )
-                                    .margin(field_margin(ui))
-                                    .desired_width((ui.available_width() - 90.0).max(180.0)),
+                                TextEdit::multiline(&mut self.cfg.ai_tone)
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("例：我是后端组的张三，日志写给部门周报，用第一人称、简洁正式"),
+                            );
+                            if ui.button("保存 AI 设置").clicked() {
+                                self.persist();
+                                self.hint("AI 日志设置已保存");
+                            }
+                            ui.label(
+                                RichText::new("注意：密钥以明文保存于本机配置文件；生成时把勾选的提交说明与文件清单发给该服务，注意涉密内容。")
+                                    .weak()
+                                    .size(11.0),
                             );
                         });
-                        ui.aligned_row(|ui| {
-                            ui.label("API Key");
-                            ui.add(
-                                TextEdit::singleline(&mut self.cfg.ai_key)
-                                    .password(true)
-                                    .hint_text("sk-…")
-                                    .margin(field_margin(ui))
-                                    .desired_width((ui.available_width() - 90.0).max(180.0)),
-                            );
-                        });
-                        ui.aligned_row(|ui| {
-                            ui.label("模型名  ");
-                            ui.add(
-                                TextEdit::singleline(&mut self.cfg.ai_model)
-                                    .hint_text("如 deepseek-chat / gpt-4o-mini / qwen-plus")
-                                    .margin(field_margin(ui))
-                                    .desired_width((ui.available_width() - 90.0).max(180.0)),
-                            );
-                        });
-                        ui.label(RichText::new("口吻").size(11.5).weak());
-                        ui.add(
-                            TextEdit::multiline(&mut self.cfg.ai_tone)
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("例：我是后端组的张三，日志写给部门周报，用第一人称、简洁正式"),
-                        );
-                        if ui.button("保存 AI 设置").clicked() {
-                            self.persist();
-                            self.hint("AI 日志设置已保存");
-                        }
-                        ui.label(
-                            RichText::new("注意：密钥以明文保存于本机配置文件；生成时把勾选的提交说明与文件清单发给该服务，注意涉密内容。")
-                                .weak()
-                                .size(11.0),
-                        );
-                    });
-                    ui.separator();
+                        ui.separator();
+                    }
+
                     ui.collapsing("版本更新", |ui| {
                         ui.label(RichText::new("更新源").size(11.5).weak());
                         ui.aligned_row(|ui| {
@@ -697,6 +701,13 @@ impl RepoApp {
                             ui.label(RichText::new("未配置服务端地址，不会检查更新").size(11.5).weak());
                         }
                     });
+                    ui.separator();
+                    // 插件管理已独立成面板：顶栏拼图图标打开（见 plugins.rs）
+                    ui.label(
+                        RichText::new("可选功能（插件）已移到标题栏右上角的拼图按钮，在独立面板里安装 / 卸载。")
+                            .weak()
+                            .size(11.5),
+                    );
                 });
             });
         self.show_settings = open;

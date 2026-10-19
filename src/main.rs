@@ -17,7 +17,11 @@ mod home;
 mod icons;
 mod jobs;
 mod localdiff;
+mod merge;
+mod merge_model;
 mod notify;
+mod plugin_host;
+mod plugins;
 mod repo;
 mod settings;
 mod svn;
@@ -135,14 +139,17 @@ pub struct BatchLabel {
     pub focus: bool,
 }
 
-/// 目录行「更多 → 差异过滤与提交屏蔽」的窗口状态。两格都是本目录的配置：过滤条件写
+/// 目录行「更多 → 差异过滤与提交屏蔽」的窗口状态。四格都是本目录的配置：过滤条件写
 /// `DirConfig::bc_filter`（只管本地差异比对）、屏蔽规则写 `DirConfig::commit_excludes`
-/// （决定会不会被提交）。窗口里另存一份过滤条件的行视图：配置里是分号串，
+/// （决定会不会被提交）、合并范围两格写 `merge_include` 与 `merge_exclude`。四格分两页标签
+/// 摆放，切页只动 `page`。窗口里另存一份过滤条件的行视图：配置里是分号串，
 /// 框里要一行一条。
 #[derive(Clone)]
 pub struct CommitRules {
     /// 打开窗口那一刻提交页所在的目录
     pub dir: usize,
+    /// 当前停在哪一页：0 = 差异过滤与提交屏蔽，1 = 双向合并范围
+    pub page: usize,
     /// `bc_filter` 的行视图：编辑期间以它为准，落盘时按 `;` 拼回分号串
     pub filter_buf: String,
     /// 窗口开着时过滤条件改过：关窗口那一刻按新口径重算一次本地差异
@@ -155,11 +162,32 @@ impl CommitRules {
     pub(crate) fn new(dir: usize, bc_filter: &str) -> Self {
         Self {
             dir,
+            page: 0,
             filter_buf: crate::commit::bc_filter_lines(bc_filter),
             filter_dirty: false,
             focus: true,
         }
     }
+}
+
+/// 「本地开发侧 ↔ 服务器端双向合并」的预览窗口。清单只待在内存里：它带着每个文件两边
+/// 要写的字节，落盘按这份清单走，重启后重算一份才是真的现状。
+#[derive(Default)]
+pub struct MergePreview {
+    pub dir: usize,
+    /// `None` = 还在算，或上一次预览失败了
+    pub plan: Option<crate::merge::Plan>,
+    /// 第一下只把按钮换成「确认写入并备份」，再点一次才真的动两边
+    pub confirm: bool,
+    /// 上一次预览 / 落盘没成的原因
+    pub error: String,
+    /// 历史备份清单，展开「还原」那一栏时才去扫备份目录
+    pub backups: Vec<crate::merge::BackupInfo>,
+    pub show_backups: bool,
+    /// 最大化 / 还原，与两个明细窗口共用一套
+    pub zoom: crate::history::Zoom,
+    /// 「清理备份」的第一下只把确认亮出来，再点一次才真删
+    pub wipe: bool,
 }
 
 /// 「回退到某个版本」确认窗口：把整个目录或单个文件倒回所选版本，改动先落在本地。
@@ -402,9 +430,15 @@ pub struct RepoApp {
     pub rollback: Option<Rollback>,
     /// 「解决冲突」窗口（None = 窗口关闭）
     pub resolve: Option<Resolve>,
+    /// 「本地开发侧 ↔ 服务器端双向合并」窗口（None = 窗口关闭）
+    pub merge: Option<MergePreview>,
     /// 「差异过滤与提交屏蔽」窗口，目录行「更多」里开（None = 窗口关闭）
     pub commit_rules: Option<CommitRules>,
     pub show_settings: bool,
+    /// 「插件」面板开关：顶栏拼图图标点开，独立窗口（不再塞在设置页里）
+    pub show_plugins: bool,
+    /// 测试用：覆盖「插件在不在」的判断（None = 照实看 dll 文件）
+    pub plugin_present: Option<bool>,
     pub confirm_remove: Option<usize>,
     pub auto_scroll: bool,
     pub next_refresh: Instant,

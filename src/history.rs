@@ -259,12 +259,15 @@ impl Zoom {
         window: egui::Window<'a>,
         normal: Rect,
     ) -> egui::Window<'a> {
+        // 显式给矩形的那一帧不能让它再夹一次：夹的时候用的是「上一帧存下的尺寸」，
+        // 而尺寸要到这一帧画完才更新 —— 刚退出最大化时它还写着整屏宽，
+        // 于是本该还原到原位的窗口被横向挤到屏幕左边。
         let window = window.default_rect(normal);
         if self.maximized {
             self.rect.get_or_insert(normal);
-            window.fixed_rect(ctx.content_rect())
+            window.fixed_rect(ctx.content_rect()).constrain(false)
         } else if let Some(rect) = self.restore.take() {
-            window.fixed_rect(rect)
+            window.fixed_rect(rect).constrain(false)
         } else {
             window
         }

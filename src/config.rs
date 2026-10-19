@@ -2,6 +2,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// `DirConfig::merge_include` 留空时用的内置白名单：代码与文本类扩展名，裸写法（`Excludes` 的
+/// 包含模式会自动补 `+`）。构建产物、图片、压缩包默认不参与合并——把 zip 静默搬来搬去不是
+/// 这里该做的事，他要合非文本文件得自己在白名单里写明。
+pub const DEFAULT_MERGE_INCLUDE: &str = "*.java;*.xml;*.sql;*.vue;*.js;*.ts;*.json;*.properties;\
+*.yml;*.yaml;*.html;*.htm;*.css;*.md;*.txt;*.py;*.cs;*.go;*.sh;*.bat;*.conf;*.ini";
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DirConfig {
@@ -18,6 +24,20 @@ pub struct DirConfig {
     /// 命中的条目默认从提交页消失，也不进提交清单、不计进主页「待提交 N 项」；
     /// 写法与上面的 `bc_filter` 同一套（那边只管差异比较，两边各存各的）
     pub commit_excludes: String,
+    /// 本目录的「参与合并的文件」白名单，规则窗口第二页的上格，写法与 `bc_filter` 一致（一行一条）。
+    /// 只划定「本地开发侧 ↔ 服务器端」双向合并的范围：白名单外的差异原样不动，
+    /// 不参与合并、也不改写第一页两格的任何口径。留空按内置的代码 / 文本扩展名清单走，
+    /// 写了内容就只按写的走（非文本文件要他显式加进来）。要在此之上再排除，见下面的 `merge_exclude`
+    pub merge_include: String,
+    /// 本目录的「不参与合并的文件」黑名单，规则窗口第二页的下格，写法与「屏蔽可提交项」
+    /// 一致（一行一条，裸写法自动补 `-`）。它在白名单之后再生效一次，只收窄合并范围：
+    /// 命中的差异原样不动，既不改差异数也不管提交。留空表示不额外排除
+    /// （`.svn`、`.git` 与落盘临时文件本来就不参与）
+    pub merge_exclude: String,
+    /// 双向合并的 LCS 行数规模上限（祖先行数 × 变化侧行数）。超过就退化为「字节级单方改写」
+    /// 兜底（见 merge.rs 的 too_big 处理），不跑精确行合并。0 = 用内置 60_000_000
+    #[serde(default)]
+    pub lcs_cell_limit: usize,
     /// 手动分组名，空 = 未分组（列表里不画组标题）
     pub group: String,
     /// 目录标记的文字，空 = 无标记
@@ -267,6 +287,15 @@ mod tests {
         assert!(parsed.dirs[0].bc_filter.is_empty());
         // 「屏蔽可提交项」同样是后加字段：老配置没有要按空值补齐（= 一条都不屏蔽）
         assert!(parsed.dirs[0].commit_excludes.is_empty());
+        // 「参与合并的文件」也是后加字段：老配置没有按空值补齐，而空值就是「按内置的代码 /
+        // 文本清单参与合并」，所以老配置升级后不必迁移也直接能用
+        assert!(parsed.dirs[0].merge_include.is_empty());
+        // 黑名单同理：老配置没有就按空值补齐，空值等于黑名单一条都不挡
+        assert!(parsed.dirs[0].merge_exclude.is_empty());
+        assert!(crate::merge::blacklist(&parsed.dirs[0].merge_exclude).is_none());
+        let scope = crate::merge::scope(&parsed.dirs[0].merge_include);
+        assert!(scope.hits(r"src\main\Foo.java"), "老配置要能默认合代码");
+        assert!(!scope.hits("bin/tool.exe"), "内置白名单不碰构建产物");
         // 服务器端所在侧是后加的设置，老配置没有也要按默认值（左侧）补齐
         assert_eq!(parsed.bc_server_side, "left");
         assert_eq!(parsed.theme, "system");

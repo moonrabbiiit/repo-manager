@@ -122,10 +122,13 @@ impl RepoApp {
             batch_label: None,
             rollback: None,
             resolve: None,
+            merge: None,
             commit_rules: None,
             svn_user: String::new(),
             user_probed: false,
             show_settings: false,
+            show_plugins: false,
+            plugin_present: None,
             confirm_remove: None,
             auto_scroll: true,
             next_refresh: Instant::now() + Duration::from_secs(4),
@@ -532,6 +535,43 @@ impl RepoApp {
                             String::new()
                         };
                     }
+                }
+                (Kind::Merge, Data::MergePlan { dir, ok, plan }) => {
+                    // 只往还开着的那扇窗口里放：预览是那一刻的状态，窗口关了就丢掉，
+                    // 下次开窗口重算一份才是真的现状
+                    if let Some(preview) = self.merge.as_mut().filter(|p| p.dir == dir) {
+                        preview.plan = plan.map(|boxed| *boxed);
+                        preview.error = if ok {
+                            String::new()
+                        } else {
+                            "合并预览没算出来，原因见输出区".to_owned()
+                        };
+                    }
+                }
+                (Kind::ApplyMerge, Data::Run { dir, ok, message, reload }) => {
+                    if ok {
+                        // 落盘成了就关窗：这份清单已经应用完了，留着只会让人再点一次
+                        self.merge = None;
+                        self.hint(message.clone());
+                    } else if let Some(preview) = self.merge.as_mut().filter(|p| p.dir == dir) {
+                        preview.error = message.clone();
+                        preview.confirm = false;
+                    }
+                    self.push(if ok { Level::Success } else { Level::Error }, message);
+                    // 半途失败也照样重读：已经写出去的那几项得在差异数和「待提交」里如实反映
+                    if reload {
+                        self.spawn_status(dir, false);
+                        self.spawn_refresh(dir, false);
+                    }
+                }
+                (Kind::CleanBackup, Data::Run { dir, ok, message, .. }) => {
+                    // 备份栏重扫一遍：删掉的几条得从清单里下去，确认也顺手收掉。
+                    // 没动两边的文件，就不必跟着补检测
+                    if let Some(preview) = self.merge.as_mut().filter(|p| p.dir == dir) {
+                        preview.backups = crate::merge::backups(&crate::config::config_dir());
+                        preview.wipe = false;
+                    }
+                    self.push(if ok { Level::Success } else { Level::Error }, message);
                 }
                 (Kind::Status, Data::Status { dir: index, entries, ok, message }) => {
                     // 先数完再把 entries 交给提交页（它拿走所有权）
@@ -1173,12 +1213,14 @@ impl eframe::App for RepoApp {
             }
         });
         self.settings(&ctx);
+        self.plugins_window(&ctx);
         self.update_confirm_dialog(&ctx);
         self.relocate_dialog(&ctx);
         self.batch_relocate_dialog(&ctx);
         self.batch_label_dialog(&ctx);
         self.rollback_dialog(&ctx);
         self.resolve_dialog(&ctx);
+        self.merge_dialog(&ctx);
         self.upload_all_dialog(&ctx);
         self.commit_rules_dialog(&ctx);
         self.file_diff_window(&ctx);

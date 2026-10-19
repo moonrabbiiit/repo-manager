@@ -8,8 +8,6 @@
 //! curl（不出现在命令行参数里，任务管理器看不到）；请求用系统自带的 curl.exe，
 //! 不给程序增加 HTTP 依赖。内网地址照 update.rs 的规则绕过系统代理。
 
-use std::path::PathBuf;
-
 use egui::{Align, Color32, FontId, Frame, RichText, ScrollArea, TextEdit, Ui, Vec2};
 
 use crate::jobs::{Data, Kind};
@@ -70,55 +68,8 @@ pub fn build_content(picks: &[AiPick]) -> String {
     text
 }
 
-/// 组装请求体（OpenAI 兼容 /chat/completions，非流式）。
-pub fn build_body(model: &str, system: &str, user: &str) -> String {
-    serde_json::json!({
-        "model": model,
-        "stream": false,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ]
-    })
-    .to_string()
-}
-
-/// 组装发给 AI 的两段提示词。口吻为空时用中性的默认说法。
-pub fn build_prompt(tone: &str, extra: &str, content: &str) -> (String, String) {
-    let system = "你是一名认真负责的软件开发工程师，现在要根据 SVN 提交记录为提交人撰写工作日志。\
-                  只依据提供的提交记录归纳，不要编造记录之外的内容。"
-        .to_owned();
-    let mut user = String::from("请根据下面的 SVN 提交记录，生成一份工作日志。\n\n要求：\n\
-        - 把提交记录归纳成若干条工作事项，每条一到两句话，突出完成了什么、改动了什么、解决了什么问题。\n\
-        - 同一文件的多次相关改动尽量合并描述，不要逐版本流水账。\n\
-        - 直接输出日志正文，不要解释，不要用 Markdown 代码块包裹。\n");
-    let tone = tone.trim();
-    if tone.is_empty() {
-        user.push_str("- 语言简洁、正式。\n");
-    } else {
-        user.push_str(&format!("- 口吻与身份：{tone}\n"));
-    }
-    let extra = extra.trim();
-    if !extra.is_empty() {
-        user.push_str(&format!("- 其他要求：{extra}\n"));
-    }
-    user.push_str("\n提交记录如下（每条包含目录、版本、修改内容与涉及文件）：\n\n");
-    user.push_str(content);
-    (system, user)
-}
-
-/// 服务地址自动补全：OpenAI 兼容接口的完整地址固定以 /chat/completions 结尾，
-/// 但用户经常只填 base 地址（如 https://dashscope.aliyuncs.com/compatible-mode/v1
-/// 或 https://api.deepseek.com），少一段路径服务端就会报 url error，这里统一补上。
-pub fn normalize_url(url: &str) -> String {
-    let mut url = url.trim().trim_end_matches('/').to_owned();
-    if !url.ends_with("/chat/completions") {
-        url.push_str("/chat/completions");
-    }
-    url
-}
-
-/// 调 AI 接口，返回日志正文。地址 / Key / 模型任一为空都直接报错，不发起请求。
+/// 调 AI 接口，返回日志正文。真正的请求在 `ai-log-plugin.dll` 里：
+/// 这里只把参数过 ABI，不碰网络，也不碰提示词。
 pub fn request(
     url: &str,
     key: &str,
@@ -127,125 +78,32 @@ pub fn request(
     extra: &str,
     content: &str,
 ) -> Result<String, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("尚未配置 AI 服务地址（设置 → AI 日志）".to_owned());
-    }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(format!("AI 服务地址要以 http:// 或 https:// 开头：{url}"));
-    }
-    let url = normalize_url(url);
-    let key = key.trim();
-    if key.is_empty() {
-        return Err("尚未配置 API Key（设置 → AI 日志）".to_owned());
-    }
-    let model = model.trim();
-    if model.is_empty() {
-        return Err("尚未配置模型名（设置 → AI 日志）".to_owned());
-    }
-    let (system, user) = build_prompt(tone, extra, content);
-    let body = build_body(model, &system, &user);
-    let response = post_json(&url, key, &body)?;
-    parse_response(&response)
-}
-
-/// 用系统 curl 发 POST。请求头（含 API Key）写进 curl 的 `--config` 配置文件，
-/// 不走命令行参数——命令行在任务管理器里谁都能看到，配置文件用完即删。
-fn post_json(url: &str, key: &str, body: &str) -> Result<String, String> {
-    let curl = crate::update::find_curl()
-        .ok_or("未找到系统 curl.exe（Windows 10 1803+ 自带），无法调用 AI 接口")?;
-    let dir = std::env::temp_dir().join("RepoManager").join("ai");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
-    let body_path = dir.join("request.json");
-    let cfg_path = dir.join("curl.cfg");
-    let resp_path = dir.join("response.json");
-    let to_curl = |path: &PathBuf| path.display().to_string().replace('\\', "/");
-    std::fs::write(&body_path, body.as_bytes()).map_err(|e| format!("写请求体失败：{e}"))?;
-    let cfg_text = format!(
-        "request = \"POST\"\n\
-         header = \"Content-Type: application/json\"\n\
-         header = \"Authorization: Bearer {key}\"\n\
-         data-binary = \"@{}\"\n\
-         output = \"{}\"\n\
-         silent\nshow-error\n\
-         connect-timeout = \"20\"\nmax-time = \"300\"\n",
-        to_curl(&body_path),
-        to_curl(&resp_path)
-    );
-    std::fs::write(&cfg_path, cfg_text.as_bytes()).map_err(|e| format!("写 curl 配置失败：{e}"))?;
-
-    let mut cmd = std::process::Command::new(&curl);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // 界面程序：不能让 curl 弹出黑框
-        cmd.creation_flags(crate::svn::CREATE_NO_WINDOW);
-    }
-    cmd.arg("--config").arg(&cfg_path).arg(url);
-    // 内网地址绕过系统代理（http_proxy 环境变量会把内网请求转发出去连不回来）
-    if crate::update::is_private_host(url) {
-        cmd.arg("--noproxy").arg("*");
-    }
-    let output = cmd.output();
-    // 密钥已经用完了，请求体也发完了：不管成败都先删掉这两个文件
-    let _ = std::fs::remove_file(&cfg_path);
-    let _ = std::fs::remove_file(&body_path);
-    let output = output.map_err(|e| format!("无法启动 {}：{e}", curl.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "curl 退出码 {}：{}",
-            output.status.code().unwrap_or(-1),
-            if stderr.trim().is_empty() { "无错误输出".to_owned() } else { stderr.trim().to_owned() }
-        ));
-    }
-    let text = std::fs::read_to_string(&resp_path)
-        .map_err(|e| format!("读取 AI 返回失败：{e}（服务端可能没有返回内容）"))?;
-    let _ = std::fs::remove_file(&resp_path);
-    Ok(text)
-}
-
-/// 解析 AI 返回：成功取 `choices[0].message.content`，失败把 `error.message`
-/// 或原文前 300 字挑出来给人看。
-fn parse_response(text: &str) -> Result<String, String> {
-    let trimmed = text.trim();
-    let value: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|_| format!("AI 返回的不是 JSON：{}", preview(trimmed)))?;
-    if let Some(content) = value
-        .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-    {
-        if !content.trim().is_empty() {
-            return Ok(content.to_owned());
-        }
-    }
-    if let Some(message) = value.pointer("/error/message").and_then(|m| m.as_str()) {
-        let mut text = format!("AI 接口报错：{message}");
-        // 阿里云百炼对错误路径 / 端点不匹配统一报 url error（见其错误码文档）
-        if message.to_ascii_lowercase().contains("url error") {
-            text.push_str(
-                "\n提示：一般是服务地址不对。OpenAI 兼容地址要以 /chat/completions 结尾，\n\
-                 通义百炼填 https://dashscope.aliyuncs.com/compatible-mode/v1 即可（程序会自动补全）；\n\
-                 若地址本身完整，请检查模型名与端点类型是否匹配（多模态模型不能用纯文本端点）。",
-            );
-        }
-        return Err(text);
-    }
-    Err(format!("无法从 AI 返回里取到日志内容：{}", preview(trimmed)))
-}
-
-fn preview(text: &str) -> String {
-    let taken: String = text.chars().take(300).collect();
-    if text.chars().count() > 300 {
-        format!("{taken}…")
-    } else {
-        taken
-    }
+    let data = crate::plugin_host::call(
+        crate::plugins::AI_LOG_DLL,
+        "generate",
+        serde_json::json!({
+            "url": url,
+            "key": key,
+            "model": model,
+            "tone": tone,
+            "extra": extra,
+            "content": content,
+        }),
+    )?;
+    data.get("text")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| "插件没有返回日志正文".to_owned())
 }
 
 impl RepoApp {
     /// 把勾选的提交发给 AI（后台任务，结果整块回传）
     pub fn spawn_ai_log(&mut self) {
+        if !self.plugin_installed(crate::plugins::PluginId::AiLog) {
+            self.hint("「AI 工作日志」插件没装：点顶栏的拼图按钮导入 ai-log-plugin.dll");
+            return;
+        }
         if self.pool.has(Kind::AiLog, usize::MAX) {
             return;
         }
@@ -282,6 +140,11 @@ impl RepoApp {
 
     /// 「AI 工作日志」窗口：汇总各目录勾选的提交，编辑口吻与额外要求，一键生成。
     pub fn worklog_window(&mut self, ctx: &egui::Context) {
+        // 插件被卸载后，即使窗口状态还挂着也整扇收起
+        if !self.plugin_installed(crate::plugins::PluginId::AiLog) {
+            self.show_worklog = false;
+            return;
+        }
         if !self.show_worklog {
             return;
         }
@@ -703,66 +566,31 @@ mod tests {
         assert_eq!(file_count(&picks), 3);
     }
 
-    /// 口吻与额外提示词都要进用户提示词；口吻为空时用默认说法兜底
+    /// 插件没装：窗口即使被置为打开也立刻收起，一个字都不画
     #[test]
-    fn prompt_carries_tone_and_extra() {
-        let content = build_content(&[]);
-        let (system, user) = build_prompt("第一人称，简洁正式", "重点写订单模块", &content);
-        assert!(system.contains("不要编造"));
-        assert!(user.contains("口吻与身份：第一人称，简洁正式"));
-        assert!(user.contains("其他要求：重点写订单模块"));
-        let (_, plain) = build_prompt("  ", "", &content);
-        assert!(plain.contains("语言简洁、正式"));
-        assert!(!plain.contains("其他要求"));
-    }
-
-    /// 请求体必须是合法 JSON：模型、两条消息、非流式
-    #[test]
-    fn body_is_valid_openai_json() {
-        let (system, user) = build_prompt("t", "", "c");
-        let body = build_body("deepseek-chat", &system, &user);
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["model"], "deepseek-chat");
-        assert_eq!(value["stream"], false);
-        assert_eq!(value["messages"][0]["role"], "system");
-        assert_eq!(value["messages"][1]["role"], "user");
-    }
-
-    /// 返回解析：标准 OpenAI 结构取 content；错误结构取 error.message；乱返回给原文预览
-    #[test]
-    fn response_parsing() {
-        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"日志正文\n第二条"}}]}"#;
-        assert_eq!(parse_response(ok).unwrap(), "日志正文\n第二条");
-        let err = r#"{"error":{"message":"Incorrect API key"}}"#;
-        assert!(parse_response(err).unwrap_err().contains("Incorrect API key"));
-        assert!(parse_response("not json").unwrap_err().contains("not json"));
-        let empty = r#"{"choices":[]}"#;
-        assert!(parse_response(empty).unwrap_err().contains("无法从 AI 返回里取到"));
-        // url error 附带排查提示（阿里云百炼对错误路径统一这么报）
-        let url_err = r#"{"error":{"message":"url error, please check url！"}}"#;
-        let hint = parse_response(url_err).unwrap_err();
-        assert!(hint.contains("chat/completions"));
-    }
-
-    /// 服务地址补全：base 地址补上 /chat/completions，完整地址原样保留
-    #[test]
-    fn url_normalization() {
-        assert_eq!(
-            normalize_url("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    fn the_worklog_window_stays_shut_without_the_plugin() {
+        let _appdata = crate::testbed::lock_appdata();
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.plugin_present = Some(false);
+        app.show_worklog = true;
+        let mut input = crate::testbed::base_input();
+        input.events = Vec::new();
+        let mut out = ctx.run_ui(input, |ui| app.worklog_window(ui.ctx()));
+        out.textures_delta.clear();
+        let texts: Vec<&str> = out
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|text| text.contains("AI 工作日志")),
+            "插件没装时不该画窗口：{texts:?}"
         );
-        assert_eq!(
-            normalize_url("https://api.deepseek.com"),
-            "https://api.deepseek.com/chat/completions"
-        );
-        assert_eq!(
-            normalize_url("https://api.deepseek.com/v1/"),
-            "https://api.deepseek.com/v1/chat/completions"
-        );
-        assert_eq!(
-            normalize_url("https://api.deepseek.com/v1/chat/completions"),
-            "https://api.deepseek.com/v1/chat/completions"
-        );
-        assert_eq!(normalize_url(" https://api.deepseek.com "), "https://api.deepseek.com/chat/completions");
+        assert!(!app.show_worklog, "被挡住时要把窗口状态清掉");
     }
 }

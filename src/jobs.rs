@@ -12,6 +12,12 @@ pub enum Kind {
     LocalDiff,
     /// 导出本地差异诊断报告：把每一项判定展开成文字（原因 / 差异字节 / 行摘录）写成文件
     Diagnose,
+    /// 双向合并的预览：算出每个文件两边各改了哪些行、哪些能合、哪些要人工，一个字节都不写
+    Merge,
+    /// 按预览清单落盘：先整份备份两边，再写；算写操作
+    ApplyMerge,
+    /// 清理历次合并留在配置目录里的备份目录：不碰两边文件，但删完就退不回合并前
+    CleanBackup,
     Status,
     Log,
     /// 某次提交对单个文件 / 目录的逐行差异（双击历史页的涉及文件）
@@ -95,6 +101,13 @@ pub enum Data {
     /// 本地端 ↔ 服务器端工作副本的逐文件差异。失败原因由任务自己写进输出区，这里只回
     /// 「成没成」：`ok=false` 时界面把 `DirView::local_diff` 清成 `None`，不显示数字。
     LocalDiff { dir: usize, ok: bool, summary: crate::localdiff::Summary },
+    /// 双向合并的预览清单（`Box` 包住：清单本身带几千条文件与两份待写字节，别把它塞进 enum）。
+    /// `ok=false` 时 `plan` 为 `None`，原因由任务写进输出区
+    MergePlan {
+        dir: usize,
+        ok: bool,
+        plan: Option<Box<crate::merge::Plan>>,
+    },
     Status {
         dir: usize,
         entries: Vec<StatusEntry>,
@@ -197,10 +210,11 @@ impl Pool {
 
     pub fn is_busy(&self, dir: usize) -> bool {
         // 本地端比对不算「这个目录在忙」：它只是后台多读几秒树，按住了会把「移除」按钮、
-        // 卡片 ↓ 标记的点击、relocate 入口一起锁掉，还会把边框染成忙色
-        self.tasks
-            .iter()
-            .any(|task| task.dir == dir && task.kind != Kind::LocalDiff)
+        // 卡片 ↓ 标记的点击、relocate 入口一起锁掉，还会把边框染成忙色。
+        // 合并预览同一类：一个文件的定岔就可能走十几次网络往返
+        self.tasks.iter().any(|task| {
+            task.dir == dir && task.kind != Kind::LocalDiff && task.kind != Kind::Merge
+        })
     }
 
     /// 该目录的本地端比对是否正在跑（只驱动「本地端差异」那一枚标记的转圈）。
@@ -216,7 +230,7 @@ impl Pool {
                 && matches!(
                     task.kind,
                     Kind::Update | Kind::Commit | Kind::Maintain | Kind::Resolve
-                    | Kind::Rollback | Kind::Relocate
+                    | Kind::Rollback | Kind::Relocate | Kind::ApplyMerge
                 )
         })
     }
@@ -300,6 +314,20 @@ mod tests {
         // 回退改的是工作副本里的文件，和提交一样要按住其他写操作
         pool.spawn(Kind::Rollback, 5, "回退".into(), |_| data());
         assert!(pool.is_writing(5), "回退算写操作");
+    }
+
+    /// 预览往回扫历史可能走几十次网络往返，把它算成「这个目录在忙」会把移除按钮、
+    /// 卡片点击、relocate 入口一起锁掉；落盘真的改文件，才需要跟提交互相按住
+    #[test]
+    fn the_merge_preview_is_read_but_apply_is_write() {
+        let mut pool = Pool::default();
+        pool.spawn(Kind::Merge, 3, "合并预览".into(), |_| data());
+        assert!(!pool.is_busy(3), "预览算读操作，不按着这个目录");
+        assert!(!pool.is_writing(3), "预览一个字节都不写");
+        pool.spawn(Kind::ApplyMerge, 3, "应用合并".into(), |_| data());
+        assert!(pool.is_busy(3), "落盘要按住这个目录");
+        assert!(pool.is_writing(3), "落盘是写操作");
+        assert!(!pool.is_writing(4), "别的目录不受影响");
     }
 
     /// 后台线程 panic 时通道会断开：必须回报，否则页面标志位再也清不掉（点了没反应）。

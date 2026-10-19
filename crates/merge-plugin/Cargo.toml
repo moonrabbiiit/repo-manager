@@ -1,0 +1,21 @@
+[package]
+name = "merge-plugin"
+version = "1.0.0"
+edition = "2021"
+description = "双向合并插件（repo-manager 动态库插件）"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "merge_plugin"
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+encoding_rs = "0.8.35"
+regex = "1.13.1"
+roxmltree = "0.21.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
