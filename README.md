@@ -4,6 +4,13 @@
 
 > 全中文界面；浅色 / 深色主题跟随系统，亦可手动切换。可执行文件约 10 MB，双击即可运行。
 
+> **维护模式（自 2.0.1 起）**
+>
+> 本项目已进入**仅维护**状态：主程序只做缺陷修复与兼容性适配，不再接受新的功能改动。
+> 需要新功能时，请以**插件**（独立 `cdylib` 动态库）的形式开发，随 `plugin\` 目录分发、不侵入主程序。
+> 可参照 `plugin\` 下现有的两个插件，源码分别在 `crates\merge-plugin\`、`crates\ai-log-plugin\`，
+> 详见[维护模式与插件开发](#维护模式与插件开发)。
+
 ---
 
 ## 目录
@@ -26,12 +33,15 @@
 - [版本自动更新](#版本自动更新)
 - [配置与运行期文件](#配置与运行期文件)
 - [开发与测试](#开发与测试)
+- [维护模式与插件开发](#维护模式与插件开发)
 - [说明与限制](#说明与限制)
 - [许可证](#许可证)
 
 ---
 
 ## 功能特性
+
+> 「本地双向合并」与「AI 工作日志」以插件形式提供（`plugin\` 下的两个 dll）。未安装对应插件时，相关入口不显示；新增功能亦按此方式扩展，见[维护模式与插件开发](#维护模式与插件开发)。
 
 ### 仓库后端
 
@@ -310,7 +320,8 @@ python tools\update_server.py D:\update_root --serve --port 8666
 ## 开发与测试
 
 ```bat
-cargo test
+cargo test                                   :: 主程序（src\ 内联用例 + tests\ 无头 egui 回归）
+cargo test -p merge-plugin -p ai-log-plugin  :: 两个插件（三路合并、AI 日志组装与回包解析）
 ```
 
 测试不依赖真实 SVN / Git 仓库，覆盖面包括：
@@ -321,6 +332,7 @@ cargo test
 - 差异参数（`--internal-diff` 与 `-x "-w --ignore-eol-style"` 等参数组合）；
 - 提交目标名单（? / ! 与 A/M/D/R 的取舍、待 add / 待 delete 名单）；
 - 左右分栏排版（按实际绘制文本对齐行号、无重叠、折行而非裁切）；
+- 提交记录页列表（只绘制可视行、远距离跳转落点、过滤结果缓存失效）；
 - 历史页悬停按钮（位置正确、悬停不消失、行不抖动）；
 - Beyond Compare 会话解析与筛选条件解析（嵌套文件夹记录、空节点、目录匹配）；
 - 双向合并（行级三路合并、可验证的共同基线、普通开发目录同步快照、双向删除与删除/修改冲突、预览后两侧内容复核、同大小编辑的安全还原、真实本地 SVN 集成测试）；
@@ -351,6 +363,10 @@ cargo test
 │   ├── fonts.rs       # 中文字体加载与绑定
 │   ├── settings.rs    # 设置页
 │   └── ui.rs / header.rs / home.rs / dialogs.rs …  # 界面组件
+├── crates/            # 插件源码（各自编成 cdylib）
+│   ├── merge-plugin/  # 本地双向合并 → merge_plugin.dll
+│   └── ai-log-plugin/ # AI 工作日志   → ai_log_plugin.dll
+├── plugin/            # 插件分发目录：随 exe 同级的两个 dll（克隆后开箱可用）
 ├── tests/             # egui 无头排版回归测试
 ├── icon/              # 图标源文件与生成脚本
 ├── tools/
@@ -360,6 +376,56 @@ cargo test
 ├── build.rs / build.cmd   # 图标嵌入与一键构建
 └── Cargo.toml
 ```
+
+---
+
+## 维护模式与插件开发
+
+### 维护模式
+
+自 **2.0.1** 起，本项目进入**仅维护**状态：
+
+- 主程序（`src\`）只接受缺陷修复、兼容性适配与文档更正，**不再合并新功能**；
+- 需要新功能时，请以**插件**形式实现：独立的动态库，放进 `plugin\` 目录随程序分发，不侵入主程序代码；
+- `main` 分支已开启保护，改动需经 Pull Request 合并。
+
+### 插件是什么
+
+插件是一个 `cdylib` 动态库（`.dll`），与可执行文件同级放在 `plugin\` 目录即被识别；把 dll 删掉，对应的按钮、菜单与窗口当场消失——「装没装」只看文件在不在。配置读取、界面与状态保存都留在主程序侧，插件只负责该功能自身的算法与外部调用。
+
+现有两个插件可直接当模板：
+
+| 插件 | 分发产物 | 源码 | 负责的事 |
+|------|----------|------|----------|
+| 本地双向合并 | `plugin\merge-plugin.dll` | `crates\merge-plugin\` | 行级三路合并、共同基线、范围规则、备份与还原 |
+| AI 工作日志 | `plugin\ai-log-plugin.dll` | `crates\ai-log-plugin\` | 提示词组装、`/chat/completions` 请求、回包解析 |
+
+其中 `crates\ai-log-plugin\` 体量最小，最适合用作起点。
+
+### 接口约定
+
+C ABI，三个导出符号（`crates\*\src\abi.rs` 是完整范例）：
+
+| 符号 | 说明 |
+|------|------|
+| `rm_plugin_abi() -> u32` | 回报 ABI 版本，当前为 `1`；与主程序不一致则拒绝加载 |
+| `rm_plugin_call(op, payload) -> char*` | 唯一调用入口：`op` 为操作名，`payload` 为该操作的 UTF-8 JSON 参数（可为空串） |
+| `rm_plugin_free(char*)` | 归还 `rm_plugin_call` 返回的堆内存，调用方必须调用 |
+
+- 回包固定为 `{"ok":true,"data":…}` 或 `{"ok":false,"error":"…"}`；
+- 每个插件至少要实现一个 `info` 操作，回报 `id` / `name` / `version` / `abi`（主程序靠 `id` 认领 dll）；
+- 插件内的 panic 要用 `catch_unwind` 拦住，不能跨 FFI 边界炸穿主程序。
+
+### 新增一个插件
+
+1. 在 `crates\` 下新建 crate，`crate-type = ["cdylib"]`，照抄任一现有插件的 `abi.rs`，改写 `info` 里的 `id` / `name`；
+2. 在 `src\plugins.rs` 的 `PluginId` 里加一项（`key()` 一旦发布不可更改），并加上 dll 文件名常量；
+3. `build.cmd` 里补一条复制命令，把 `target\release\<name>.dll` 复制成 `plugin\<可读名>.dll`；
+4. 主程序侧只保留入口与界面，逻辑统一经 `plugin_host::call(dll, op, payload)` 转发。
+
+> **ABI 判据**：签名不变不等于 ABI 不变。JSON 字段改名 / 删字段 / 改单位、`char*` 的分配方变化、`panic=abort` 都会破坏契约；只加字段、只加操作、只改内部实现则不必升版本号。
+
+需要 AI 辅助开发插件时，把本节与 `crates\ai-log-plugin\` 一并交给它即可——目标就是「一个能被主程序认领的 dll，加一处入口」。
 
 ---
 
