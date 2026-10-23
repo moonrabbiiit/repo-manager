@@ -47,6 +47,60 @@ pub struct HistoryPage {
     pub custom_to: String,
     /// 区间输入有误时的提示：只报，不动已经读回来的列表
     pub range_error: String,
+    /// 列表一行的高度（不含行间距）。第一帧按排版估算，画完立刻用真实行高替换
+    /// （行内两段内容都定高，所以一行的高度就是每行的高度）；虚拟滚动靠它算位置
+    pub row_h: f32,
+    /// 过滤结果缓存：条件与记录都没变时直接复用，不必每帧重扫几千条
+    cache: Option<FilterCache>,
+}
+
+/// 一帧里要复用的过滤结果：能显示哪几条、命中落在哪几处。
+#[derive(Clone, Default)]
+struct FilterCache {
+    /// 上一次算结果时的条件；对不上就重算
+    key: Option<FilterKey>,
+    /// 该显示的行（`entries` 里的下标，自上而下）
+    visible: Vec<usize>,
+    /// 命中落点（同一顺序：先记录行、再该行涉及文件）
+    spots: Vec<Spot>,
+}
+
+/// 过滤条件的指纹。记录本身也算进去：刷新之后换了一批提交，结果当然要重算。
+#[derive(Clone, PartialEq, Eq)]
+struct FilterKey {
+    filter: String,
+    case: bool,
+    regex: bool,
+    word: bool,
+    range: Option<(NaiveDate, NaiveDate)>,
+    /// 记录本身的指纹，见 `entries_stamp`
+    entries: u64,
+}
+
+impl FilterKey {
+    fn of(page: &HistoryPage) -> Self {
+        Self {
+            filter: page.filter.clone(),
+            case: page.search_case,
+            regex: page.search_regex,
+            word: page.search_word,
+            range: page.range,
+            entries: entries_stamp(&page.entries),
+        }
+    }
+}
+
+/// 记录清单的指纹：只揉版本号与改动文件数，够分清「刷新后换了一批」，
+/// 又比逐条比路径便宜得多。服务器上的版本号是不可变的，同一批记录指纹必然相同。
+fn entries_stamp(entries: &[LogEntry]) -> u64 {
+    let mut stamp = entries.len() as u64;
+    for entry in entries {
+        for byte in entry.revision.as_bytes() {
+            stamp = stamp.wrapping_mul(31).wrapping_add(u64::from(*byte));
+        }
+        stamp = stamp.wrapping_mul(31).wrapping_add(entry.paths.len() as u64);
+    }
+    stamp
 }
 
 impl HistoryPage {
@@ -76,6 +130,8 @@ impl HistoryPage {
             custom_from: String::new(),
             custom_to: String::new(),
             range_error: String::new(),
+            row_h: 0.0,
+            cache: None,
         }
     }
 
@@ -126,7 +182,13 @@ impl Spot {
 
 /// 把结果摊平成一串落点，顺序跟眼睛看到的顺序一致：先按列表自上而下，
 /// 同一条记录里先看提交说明，再按涉及文件自上而下。
+///
+/// 没有过滤词时一处命中都不算：`Search::hits` 空输入一律返回 true（那是「不过滤」的意思），
+/// 照抄下去会变成每条记录、每个路径都算一处命中，▲▼ 的里程数就成了天文数字。
 fn spots_of(entries: &[LogEntry], visible: &[usize], search: &Search) -> Vec<Spot> {
+    if search.is_empty() {
+        return Vec::new();
+    }
     let mut spots = Vec::new();
     for index in visible {
         let entry = &entries[*index];
@@ -306,6 +368,17 @@ pub struct FileDiff {
     pub zoom: Zoom,
 }
 
+/// 列表行高的第一帧估算值：真实高度由画出来的那一行量出来，这里只要不太离谱，
+/// 差值只影响开场那一帧的滚动条长度。
+///
+/// 组成 = 外框（上下各 5 像素内边距 + 各 1 像素描边）+ 里面两段固定高度的内容：
+/// 按钮那一档的一行（`control_height`）、3 像素行间距、18 像素的提交说明行。
+fn estimate_row_height(ui: &Ui) -> f32 {
+    // 外框上下各 5 像素内边距 + 上下各 1 像素描边
+    let frame = 2.0 * (5.0 + 1.0);
+    frame + crate::ui::control_height(ui) + 3.0 + 18.0
+}
+
 fn action_color(ui: &Ui, action: char) -> Color32 {
     ink(
         ui,
@@ -322,7 +395,9 @@ fn action_color(ui: &Ui, action: char) -> Color32 {
 
 impl RepoApp {
     pub fn history_page(&mut self, ui: &mut Ui) {
-        let mut page = match self.history.clone() {
+        // 整页取出来用、帧末再放回去：记录读回来可能上万条，`clone()` 一次就是几万个
+        // 字符串分配，每帧做一遍比画界面还贵
+        let mut page = match self.history.take() {
             Some(page) => page,
             None => {
                 self.back_to_main();
@@ -737,14 +812,23 @@ impl RepoApp {
             page.search_regex,
             page.search_word,
         );
-        let visible = page.visible_with(&search);
+        // 过滤结果按条件缓存：几千条记录每帧重扫一遍（正则 + 逐路径匹配）要几十毫秒，
+        // 而条件、记录都没变的时候结果也不会变。取出来算完再放回页面里
+        let mut cache = page.cache.take().unwrap_or_default();
+        let key = FilterKey::of(&page);
+        if cache.key.as_ref() != Some(&key) {
+            cache.visible = page.visible_with(&search);
+            cache.spots = spots_of(&page.entries, &cache.visible, &search);
+            cache.key = Some(key);
+        }
+        let visible = &cache.visible;
+        let spots = &cache.spots;
         // 点三个开关或改过滤词之后，选中的那条可能被筛掉了：当场取消选中，
         // 否则右侧详情还停在一条列表里已经看不见的记录上，看着就像没刷新
         if page.picked.is_some_and(|index| !visible.contains(&index)) {
             page.picked = None;
             page.spot = None;
         }
-        let spots = spots_of(&page.entries, &visible, &search);
         // 落点会随过滤条件变（同一处下标指向的可能已是另一条记录）：对不上就重新定位
         if page
             .spot
@@ -813,124 +897,159 @@ impl RepoApp {
         ui.label(RichText::new(summary).weak().size(12.0));
 
         let body = ui.style().text_styles[&egui::TextStyle::Body].size;
+        // 行间距是固定的 3 像素，行高第一帧按排版估一档、画完立刻用真实行高替换
+        let row_gap = 3.0;
+        let row_h = if page.row_h > 0.0 {
+            page.row_h
+        } else {
+            estimate_row_height(ui)
+        };
+        let row_step = row_h + row_gap;
         ui.columns(2, |columns| {
             let width = columns[0].available_width();
             let picked = page.picked;
-            ScrollArea::vertical()
+            // ▲▼ 跳到某一处命中：虚拟化之后那条记录多半根本还没画出来，而 scroll_to_me 要等
+            // 控件画出来才生效，所以这里直接把目标滚动位置算好交给滚动区
+            columns[0].spacing_mut().item_spacing.y = row_gap;
+            let jump = page.jump.and_then(|index| {
+                let at = visible.iter().position(|row| *row == index)?;
+                let span = columns[0].available_height();
+                let total = row_step * visible.len() as f32 - row_gap;
+                Some(
+                    (at as f32 * row_step + row_h * 0.5 - span * 0.5)
+                        .clamp(0.0, (total - span).max(0.0)),
+                )
+            });
+            // 滚过去的这一帧就把一次性标志清掉：位置已经落到滚动区里，不必再来一次
+            if jump.is_some() {
+                page.jump = None;
+            }
+            let list = ScrollArea::vertical()
                 .id_salt("history_list")
-                .auto_shrink([false, false])
-                .show(&mut columns[0], |ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    for index in visible {
-                        let entry = page.entries[index].clone();
-                        let first = entry
-                            .message
-                            .lines()
-                            .next()
-                            .unwrap_or("(无提交说明)")
-                            .to_owned();
-                        // 是本机登录人的提交才给勾选 AI 日志的复选框
-                        let own = !page.author.trim().is_empty() && entry.author == page.author;
-                        // 配色跟「提交记录·文件名」明细窗口一致：白底灰边（深色主题深底浅灰边）
-                        let (row_fill, row_stroke) = if ui.visuals().dark_mode {
-                            (Color32::from_gray(40), Color32::from_gray(65))
+                .auto_shrink([false, false]);
+            let list = match jump {
+                Some(offset) => list.vertical_scroll_offset(offset),
+                None => list,
+            };
+            // 只画看得见的那十几行：几万条记录也不会把每帧的控件数堆上去。
+            // 行高均匀（行内两部分都定高），所以量得到的第一行就是每行的高度
+            let shown = list.show_rows(&mut columns[0], row_h, visible.len(), |ui, range| {
+                let mut measured: Option<f32> = None;
+                for at in range {
+                    let index = visible[at];
+                    let entry = page.entries[index].clone();
+                    let first = entry
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or("(无提交说明)")
+                        .to_owned();
+                    // 是本机登录人的提交才给勾选 AI 日志的复选框
+                    let own = !page.author.trim().is_empty() && entry.author == page.author;
+                    // 配色跟「提交记录·文件名」明细窗口一致：白底灰边（深色主题深底浅灰边）
+                    let (row_fill, row_stroke) = if ui.visuals().dark_mode {
+                        (Color32::from_gray(40), Color32::from_gray(65))
+                    } else {
+                        (Color32::WHITE, Color32::from_gray(200))
+                    };
+                    let row = Frame::new()
+                        .inner_margin(5.0)
+                        .corner_radius(5.0)
+                        .fill(if picked == Some(index) {
+                            ui.visuals().selection.bg_fill
                         } else {
-                            (Color32::WHITE, Color32::from_gray(200))
-                        };
-                        let row = Frame::new()
-                            .inner_margin(5.0)
-                            .corner_radius(5.0)
-                            .fill(if picked == Some(index) {
-                                ui.visuals().selection.bg_fill
-                            } else {
-                                row_fill
-                            })
-                            .stroke(egui::Stroke::new(1.0, row_stroke))
-                            .show(ui, |ui| {
-                                ui.aligned_row(|ui| {
-                                    // 日志模式开启时才显示勾选框（右上角「AI 日志」开关控制）；
-                                    // 是本机登录人的提交才有。勾选后收进「AI 工作日志」，跨目录汇总，
-                                    // 状态每帧按勾选清单现算
-                                    if own && self.ai_mode {
-                                        let mut checked = self
-                                            .ai_picks
-                                            .iter()
-                                            .any(|pick| pick.dir == page.dir && pick.entry.revision == entry.revision);
-                                        if ui
-                                            .checkbox(&mut checked, "")
-                                            .on_hover_text(
-                                                "勾选后加入「AI 工作日志」（可以到多个目录的历史页里反复勾选，\n\
-                                                 最后点右上角「AI 日志（N）」弹出窗口，一次性交给 AI 生成工作日志）",
-                                            )
-                                            .changed()
-                                        {
-                                            if checked {
-                                                self.ai_picks.push(crate::worklog::AiPick {
-                                                    dir: page.dir,
-                                                    dir_label: page.label.clone(),
-                                                    kind: self.dir_kind(page.dir),
-                                                    entry: entry.clone(),
-                                                });
-                                            } else {
-                                                self.ai_picks.retain(|pick| {
-                                                    !(pick.dir == page.dir
-                                                        && pick.entry.revision == entry.revision)
-                                                });
-                                            }
+                            row_fill
+                        })
+                        .stroke(egui::Stroke::new(1.0, row_stroke))
+                        .show(ui, |ui| {
+                            ui.aligned_row(|ui| {
+                                // 日志模式开启时才显示勾选框（右上角「AI 日志」开关控制）；
+                                // 是本机登录人的提交才有。勾选后收进「AI 工作日志」，跨目录汇总，
+                                // 状态每帧按勾选清单现算
+                                if own && self.ai_mode {
+                                    let mut checked = self
+                                        .ai_picks
+                                        .iter()
+                                        .any(|pick| pick.dir == page.dir && pick.entry.revision == entry.revision);
+                                    if ui
+                                        .checkbox(&mut checked, "")
+                                        .on_hover_text(
+                                            "勾选后加入「AI 工作日志」（可以到多个目录的历史页里反复勾选，\n\
+                                             最后点右上角「AI 日志（N）」弹出窗口，一次性交给 AI 生成工作日志）",
+                                        )
+                                        .changed()
+                                    {
+                                        if checked {
+                                            self.ai_picks.push(crate::worklog::AiPick {
+                                                dir: page.dir,
+                                                dir_label: page.label.clone(),
+                                                kind: self.dir_kind(page.dir),
+                                                entry: entry.clone(),
+                                            });
+                                        } else {
+                                            self.ai_picks.retain(|pick| {
+                                                !(pick.dir == page.dir
+                                                    && pick.entry.revision == entry.revision)
+                                            });
                                         }
                                     }
-                                    ui.label(highlight_with(
-                                        ui,
-                                        &fmt_rev(kind, &entry.revision),
-                                        &search,
-                                        FontId::monospace(body),
-                                        ink(ui, Color32::from_rgb(120, 190, 240)),
-                                    ));
-                                    ui.label(highlight_with(
-                                        ui,
-                                        &entry.author,
-                                        &search,
-                                        FontId::proportional(12.5),
-                                        ui.visuals().text_color(),
-                                    ));
-                                    ui.label(RichText::new(&entry.date).size(12.0).weak());
-                                    ui.label(RichText::new(format!("{} 项", entry.paths.len())).size(11.5).weak());
-                                });
-                                ui.add_sized(
-                                    Vec2::new(width - 26.0, 18.0),
-                                    egui::Label::new(highlight_with(
-                                        ui,
-                                        &first,
-                                        &search,
-                                        FontId::proportional(12.5),
-                                        ui.visuals().text_color(),
-                                    ))
-                                    .truncate(),
-                                );
-                                // 铺满整行：内容画完后把内部 ui 撑到剩余全宽，Frame 随之占满一行
-                                ui.set_width(ui.available_width());
-                                let rect = ui.max_rect();
-                                // 有复选框时把整行点击区从行首缩进 26px：不缩的话这一块
-                                // 最后注册、盖在复选框上面，点复选框会被当成点行
-                                let click_rect = if own {
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(rect.left() + 26.0, rect.top()),
-                                        rect.max,
-                                    )
-                                } else {
-                                    rect
-                                };
-                                if ui.interact(click_rect, ui.id().with(("log-row", index)), egui::Sense::click()).clicked() {
-                                    page.picked = Some(index);
                                 }
+                                ui.label(highlight_with(
+                                    ui,
+                                    &fmt_rev(kind, &entry.revision),
+                                    &search,
+                                    FontId::monospace(body),
+                                    ink(ui, Color32::from_rgb(120, 190, 240)),
+                                ));
+                                ui.label(highlight_with(
+                                    ui,
+                                    &entry.author,
+                                    &search,
+                                    FontId::proportional(12.5),
+                                    ui.visuals().text_color(),
+                                ));
+                                ui.label(RichText::new(&entry.date).size(12.0).weak());
+                                ui.label(RichText::new(format!("{} 项", entry.paths.len())).size(11.5).weak());
                             });
-                        // 这一行正是「上一处 / 下一处」跳过来的目标：滚进视野，标志用完就清
-                        if page.jump == Some(index) {
-                            row.response.scroll_to_me(Some(Align::Center));
-                            page.jump = None;
-                        }
+                            ui.add_sized(
+                                Vec2::new(width - 26.0, 18.0),
+                                egui::Label::new(highlight_with(
+                                    ui,
+                                    &first,
+                                    &search,
+                                    FontId::proportional(12.5),
+                                    ui.visuals().text_color(),
+                                ))
+                                .truncate(),
+                            );
+                            // 铺满整行：内容画完后把内部 ui 撑到剩余全宽，Frame 随之占满一行
+                            ui.set_width(ui.available_width());
+                            let rect = ui.max_rect();
+                            // 有复选框时把整行点击区从行首缩进 26px：不缩的话这一块
+                            // 最后注册、盖在复选框上面，点复选框会被当成点行
+                            let click_rect = if own {
+                                egui::Rect::from_min_max(
+                                    egui::pos2(rect.left() + 26.0, rect.top()),
+                                    rect.max,
+                                )
+                            } else {
+                                rect
+                            };
+                            if ui.interact(click_rect, ui.id().with(("log-row", index)), egui::Sense::click()).clicked() {
+                                page.picked = Some(index);
+                            }
+                        });
+                    // 量第一行就够：行高是均匀的（两段内容都定高）
+                    if measured.is_none() {
+                        measured = Some(row.response.rect.height());
                     }
-                });
+                }
+                measured
+            });
+            // 真实行高替换估算值：字号换档、皮肤改动之后自动跟上，下一帧就对齐
+            if let Some(h) = shown.inner {
+                page.row_h = h;
+            }
 
             let detail = page.picked.and_then(|index| page.entries.get(index).cloned());
             let ui2 = &mut columns[1];
@@ -1132,6 +1251,8 @@ impl RepoApp {
             }
         });
 
+        // 缓存放回页面：下一帧条件没变就直接用
+        page.cache = Some(cache);
         self.history = Some(page);
     }
 
@@ -2545,5 +2666,139 @@ mod tests {
 
         page.range = None;
         assert_eq!(visible(&page), vec![0, 1, 2, 3, 4], "不选区间时一切照旧");
+    }
+
+    /// 铺一页历史记录：每条记录说明是「条目N」，带若干改动文件
+    fn page_with(count: usize) -> HistoryPage {
+        let mut page = HistoryPage::new(0, "订单服务".to_owned(), 2000, "zhangsan".to_owned(), false);
+        page.entries = (0..count)
+            .map(|i| {
+                let mut row = entry(&format!("{}", 100 + i), "2026-09-01 10:00:00");
+                row.message = format!("条目{i}");
+                row.paths = (0..8)
+                    .map(|p| LogPath {
+                        action: 'M',
+                        kind: "file".to_owned(),
+                        path: format!("/src/app/module{p}/File.java"),
+                    })
+                    .collect();
+                row
+            })
+            .collect();
+        page
+    }
+
+    /// 列表只画看得见的那十几行：条数再多，每帧画出来的控件也是同一批。
+    /// （这条是「记录一多就卡」的根因回归：以前是把整页记录逐条画完）
+    #[test]
+    fn only_the_rows_in_view_are_painted() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.page = crate::Page::History;
+        app.history = Some(page_with(500));
+
+        // 第一帧按估算行高排，第二帧才是量准之后的样子
+        painted_frame(&ctx, &mut app, None);
+        let frame = painted_frame(&ctx, &mut app, None);
+        let painted = frame.iter().filter(|(text, _)| text.starts_with("条目")).count();
+        assert!(painted > 0, "一行都没画出来");
+        assert!(
+            painted <= 24,
+            "800 高的窗口最多摆得下二十来行，却画了 {painted} 行——没有虚拟化"
+        );
+        // 行高量准了才会被记住：量出来的是真实行高，不是估算值
+        let measured = app.history.as_ref().expect("页面还在").row_h;
+        assert!(measured > 30.0, "行高没量到：{measured}");
+    }
+
+    /// ▲▼ 跳到的记录多半在视野外：虚拟化之后它根本没被画出来，
+    /// 位置得靠行高算出来交给滚动区，不能指望 scroll_to_me
+    #[test]
+    fn jump_scrolls_a_record_far_down_into_view() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.page = crate::Page::History;
+        let mut page = page_with(500);
+        page.picked = Some(400);
+        page.jump = Some(400);
+        app.history = Some(page);
+
+        painted_frame(&ctx, &mut app, None);
+        let frame = painted_frame(&ctx, &mut app, None);
+        let (text, rect) = frame
+            .iter()
+            .find(|(text, _)| text == "条目400")
+            .cloned()
+            .expect("跳过去的那条要画出来");
+        assert_eq!(text, "条目400");
+        assert!(
+            rect.top() >= 0.0 && rect.bottom() <= 800.0,
+            "跳过去的记录要在窗口里：{rect:?}"
+        );
+        assert_eq!(app.history.as_ref().expect("页面还在").jump, None, "跳完就清标志");
+    }
+
+    /// 过滤结果按条件缓存，条件不变就不再重扫；换了记录（刷新）必须重算
+    #[test]
+    fn filtered_result_is_reused_until_the_query_or_the_records_change() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.page = crate::Page::History;
+        let mut page = page_with(30);
+        page.filter = "条目1".to_owned();
+        app.history = Some(page);
+
+        painted_frame(&ctx, &mut app, None);
+        let first = app
+            .history
+            .as_ref()
+            .unwrap()
+            .cache
+            .as_ref()
+            .expect("跑过一帧该有缓存")
+            .visible
+            .clone();
+        assert_eq!(first.len(), 11, "条目1、条目1x 共 11 条");
+
+        // 同样的条件再跑一帧：缓存原样留着（键没变就不重算）
+        painted_frame(&ctx, &mut app, None);
+        let again = app.history.as_ref().unwrap().cache.as_ref().unwrap();
+        assert_eq!(again.visible, first, "条件没变，结果也不该变");
+
+        // 换一批记录（等长、条件相同）：指纹变了就必须重算，不能拿旧结果糊过去
+        let mut replaced = page_with(30);
+        replaced.filter = "条目1".to_owned();
+        // 改的正是命中过滤词的那条：重算之后它该掉出去
+        replaced.entries[1].message = "别的说明".to_owned();
+        replaced.entries[1].revision = "999999".to_owned();
+        app.history = Some(replaced);
+        painted_frame(&ctx, &mut app, None);
+        let after = app.history.as_ref().unwrap().cache.as_ref().unwrap();
+        assert_eq!(after.visible.len(), 10, "换了记录之后要按新内容重算");
+    }
+
+    /// 没有过滤词就没有「命中」：以前空条件一律算命中，每条记录的每个路径都算一处，
+    /// 摘要里会冒出「N 处命中」这种没人看得懂的数
+    #[test]
+    fn summary_counts_no_hits_while_nothing_is_filtered() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.page = crate::Page::History;
+        app.history = Some(page_with(3));
+
+        let frame = painted_frame(&ctx, &mut app, None);
+        let summary = frame
+            .iter()
+            .find(|(text, _)| text.starts_with("3 条记录"))
+            .map(|(text, _)| text.clone())
+            .expect("摘要该报条数");
+        assert!(
+            !summary.contains("处命中"),
+            "没过滤就不该有命中计数：{summary}"
+        );
     }
 }
