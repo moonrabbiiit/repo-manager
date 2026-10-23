@@ -701,13 +701,6 @@ impl RepoApp {
                             ui.label(RichText::new("未配置服务端地址，不会检查更新").size(11.5).weak());
                         }
                     });
-                    ui.separator();
-                    // 插件管理已独立成面板：顶栏拼图图标打开（见 plugins.rs）
-                    ui.label(
-                        RichText::new("可选功能（插件）已移到标题栏右上角的拼图按钮，在独立面板里安装 / 卸载。")
-                            .weak()
-                            .size(11.5),
-                    );
                 });
             });
         self.show_settings = open;
